@@ -34,6 +34,7 @@ type Config struct {
 	SupplyChainAudience   string
 
 	KafkaBrokers          []string
+	KafkaClientID         string
 	KafkaConsumerGroup    string
 	KafkaSupplyChainTopic string
 	KafkaProductionTopic  string
@@ -73,6 +74,7 @@ func Load() (*Config, error) {
 		SupplyChainBaseURL:    strings.TrimRight(getenv("SUPPLY_CHAIN_BASE_URL", "http://127.0.0.1:4007"), "/"),
 		SupplyChainAudience:   getenv("SUPPLY_CHAIN_AUDIENCE", "iag.supply-chain"),
 		KafkaBrokers:          splitCSV(getenv("KAFKA_BROKERS", "")),
+		KafkaClientID:         getenv("KAFKA_CLIENT_ID", "iag-traceability"),
 		KafkaConsumerGroup:    getenv("KAFKA_CONSUMER_GROUP", "iag.traceability"),
 		KafkaSupplyChainTopic: getenv("KAFKA_SUPPLY_CHAIN_TOPIC", "iag.supply-chain"),
 		KafkaProductionTopic:  getenv("KAFKA_PRODUCTION_TOPIC", "iag.production"),

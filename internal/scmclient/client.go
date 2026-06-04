@@ -107,3 +107,42 @@ func (c *Client) GetQRPreview(ctx context.Context, lotBusinessID string) (map[st
 	}
 	return wrap.Data, nil
 }
+
+// ValidateLotPublish delegates full compliance checks to SCM publish-gate.
+func (c *Client) ValidateLotPublish(ctx context.Context, lotBusinessID string) error {
+	if !c.Enabled() {
+		return fmt.Errorf("scm client disabled")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/export-lots/"+lotBusinessID+"/publish-gate", nil)
+	if err != nil {
+		return err
+	}
+	if c.auth != nil {
+		if err := c.auth.AuthorizeRequest(ctx, req); err != nil {
+			return err
+		}
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		var wrap struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(b, &wrap)
+		msg := strings.TrimSpace(wrap.Error.Message)
+		if msg == "" {
+			msg = "COMPLIANCE_FAILED"
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("scm %s: %s", resp.Status, string(b))
+	}
+	return nil
+}

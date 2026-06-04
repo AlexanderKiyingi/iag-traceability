@@ -1,6 +1,6 @@
 # iag-traceability
 
-Custody events, coffee story composition, and public QR for the IAG platform.
+> Custody events, coffee story composition, and public QR for the IAG Coffee platform.
 
 | Field | Value |
 |-------|-------|
@@ -8,6 +8,7 @@ Custody events, coffee story composition, and public QR for the IAG platform.
 | **Gateway prefix** | `/api/v1/traceability` |
 | **Audience** | `iag.traceability` |
 | **Postgres schema** | `traceability` |
+| **Remote** | [iag-traceability](https://github.com/AlexanderKiyingi/iag-traceability) |
 
 ## Role
 
@@ -63,4 +64,4 @@ docs/openapi.yaml       OpenAPI spec
 
 ## Standalone repo
 
-Publish to GitHub with `tools/publish-scaffold-repos.ps1` (see monorepo docs). Run `scripts/sync-platform-go.sh` before standalone Docker builds.
+Clone from [github.com/AlexanderKiyingi/iag-traceability](https://github.com/AlexanderKiyingi/iag-traceability). Run `scripts/sync-platform-go.sh` before standalone Docker builds.

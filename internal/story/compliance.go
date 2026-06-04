@@ -6,14 +6,10 @@ import (
 	"iag-traceability/backend/internal/store"
 )
 
-// ValidateLotPublish blocks QR publish when CoA evidence is missing from events/SCM snapshot.
+// ValidateLotPublish blocks QR publish using SCM compliance gate when configured.
 func ValidateLotPublish(ctx context.Context, st *store.Store, lotBusinessID string) error {
 	if scmFetcher != nil && scmFetcher.Enabled() {
-		if lot, err := scmFetcher.GetExportLot(ctx, lotBusinessID); err == nil {
-			if lot.CoaNumber != nil && *lot.CoaNumber != "" {
-				return nil
-			}
-		}
+		return scmFetcher.ValidateLotPublish(ctx, lotBusinessID)
 	}
 	events, err := st.ListEventsForEntity(ctx, "lot", lotBusinessID, 50)
 	if err != nil {

@@ -9,14 +9,16 @@ import (
 	"github.com/google/uuid"
 
 	"iag-traceability/backend/internal/config"
+	"iag-traceability/backend/internal/kafkabus"
 	"iag-traceability/backend/internal/middleware"
 	"iag-traceability/backend/internal/store"
 	"iag-traceability/backend/internal/story"
 )
 
 type API struct {
-	Cfg   *config.Config
-	Store *store.Store
+	Cfg       *config.Config
+	Store     *store.Store
+	KafkaPub  *kafkabus.Publisher
 }
 
 func (a *API) Health(c *gin.Context) {
@@ -67,6 +69,20 @@ func (a *API) RecordEvent(c *gin.Context) {
 		apierr.BadRequest(c, "event_type, entity_type, and entity_business_id are required")
 		return
 	}
+	if err := story.ValidateEventType(body.EventType); err != nil {
+		apierr.BadRequest(c, err.Error())
+		return
+	}
+	if body.RelatedIDs == nil {
+		body.RelatedIDs = map[string]any{}
+	}
+	if body.Payload != nil {
+		if nested, ok := body.Payload["related_ids"].(map[string]any); ok {
+			for k, v := range nested {
+				body.RelatedIDs[k] = v
+			}
+		}
+	}
 	occurred := time.Now().UTC()
 	if body.OccurredAt != nil {
 		occurred = body.OccurredAt.UTC()
@@ -112,17 +128,16 @@ func (a *API) ListEvents(c *gin.Context) {
 func (a *API) PublishLotQR(c *gin.Context) {
 	lotID := c.Param("businessId")
 	if err := story.ValidateLotPublish(c.Request.Context(), a.Store, lotID); err != nil {
-		if err == story.ErrCoARequired {
-			apierr.Write(c, http.StatusUnprocessableEntity, "COMPLIANCE_FAILED", err.Error())
-			return
-		}
-		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "compliance check failed")
+		apierr.Write(c, http.StatusUnprocessableEntity, "COMPLIANCE_FAILED", err.Error())
 		return
 	}
 	token, publicURL, err := story.PublishQR(c.Request.Context(), a.Store, lotID, a.Cfg.PublicTraceBaseURL)
 	if err != nil {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to publish QR")
 		return
+	}
+	if a.KafkaPub != nil {
+		_ = a.KafkaPub.EmitLotQRPublished(c.Request.Context(), lotID, token, publicURL)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"lot_business_id": lotID,

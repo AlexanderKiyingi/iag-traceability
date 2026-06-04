@@ -15,6 +15,7 @@ import (
 	"iag-traceability/backend/internal/consumer"
 	"iag-traceability/backend/internal/db"
 	"iag-traceability/backend/internal/handlers"
+	"iag-traceability/backend/internal/kafkabus"
 	"iag-traceability/backend/internal/middleware"
 	"iag-traceability/backend/internal/migrate"
 	"iag-traceability/backend/internal/scmclient"
@@ -91,7 +92,11 @@ func main() {
 		}()
 	}
 
-	api := &handlers.API{Cfg: cfg, Store: st}
+	api := &handlers.API{
+		Cfg:      cfg,
+		Store:    st,
+		KafkaPub: kafkabus.NewPublisher(cfg.KafkaBrokers, cfg.KafkaClientID),
+	}
 	router := handlers.NewRouter(handlers.RouterDeps{
 		API:          api,
 		PlatformAuth: platformAuth,
