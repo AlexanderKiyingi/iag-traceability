@@ -1,0 +1,74 @@
+openapi: 3.0.3
+info:
+  title: iag-traceability API
+  version: 1.0.0
+  description: Custody events, chain read model, and public QR for IAG coffee traceability.
+servers:
+  - url: /api/v1/traceability
+paths:
+  /api/v1/batches/{businessId}/chain:
+    get:
+      summary: Batch chain of custody
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: businessId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Chain nodes from trace_events
+  /api/v1/events:
+    get:
+      summary: List custody events for an entity
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: entity_type
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: entity_business_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event list
+    post:
+      summary: Append a custody event
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Event created
+  /api/v1/lots/{businessId}/publish:
+    post:
+      summary: Publish public QR for export lot
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: QR token and URL
+  /public/q/{token}:
+    get:
+      summary: Public coffee story (QR payload v2)
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Public story JSON (Cache-Control public)
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

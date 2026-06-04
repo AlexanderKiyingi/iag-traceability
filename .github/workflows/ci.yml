@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: iag
+          POSTGRES_PASSWORD: iag_dev
+          POSTGRES_DB: iag_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U iag -d iag_platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Fetch platform-go from meta-repo
+        run: |
+          git clone --depth 1 --branch main https://github.com/AlexanderKiyingi/IAG_multi_backend.git /tmp/iag-meta
+          mkdir -p /tmp/deps
+          mv /tmp/iag-meta/shared/platform-go /tmp/deps/platform-go
+          rm -rf /tmp/iag-meta
+          go mod edit -replace=github.com/alvor-technologies/iag-platform-go=/tmp/deps/platform-go
+
+      - name: go mod tidy
+        run: go mod tidy
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        run: go test ./...
+        env:
+          DATABASE_URL: postgres://iag:iag_dev@localhost:5432/iag_platform?sslmode=disable
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image (standalone target)
+        run: docker build --target standalone -t iag-traceability:ci .
