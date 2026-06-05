@@ -34,37 +34,59 @@ func main() {
 	defer tracePool.Close()
 
 	rows, err := scmPool.Query(ctx, `
-		SELECT te.occurred_at, te.event_type, te.entity_type,
-			COALESCE(te.related_ids->>'batch_business_id', te.related_ids->>'lot_business_id', te.related_ids->>'farmer_business_id', te.entity_type || ':' || te.entity_id::text),
+		SELECT te.id::text, te.occurred_at, te.event_type, te.entity_type,
+			COALESCE(
+				CASE te.entity_type
+					WHEN 'batch' THEN (SELECT business_id FROM batches WHERE id = te.entity_id)
+					WHEN 'lot' THEN (SELECT business_id FROM export_lots WHERE id = te.entity_id)
+					WHEN 'farmer' THEN (SELECT business_id FROM suppliers WHERE id = te.entity_id AND supplier_type = 'farmer')
+					WHEN 'farm' THEN (SELECT business_id FROM farms WHERE id = te.entity_id)
+					WHEN 'party' THEN (SELECT business_id FROM suppliers WHERE id = te.entity_id)
+				END,
+				te.related_ids->>'batch_business_id',
+				te.related_ids->>'lot_business_id',
+				te.related_ids->>'farmer_business_id',
+				te.related_ids->>'farm_business_id',
+				te.related_ids->>'party_business_id'
+			),
 			te.entity_id, te.related_ids, te.actor_id, te.measurements
 		FROM trace_events te ORDER BY te.occurred_at`)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer rows.Close()
-	var n int
+	var n, skipped int
 	for rows.Next() {
+		var scmID string
 		var occurred time.Time
 		var eventType, entityType, entityBiz, actorID string
 		var entityID *string
 		var rel, meas []byte
-		if err := rows.Scan(&occurred, &eventType, &entityType, &entityBiz, &entityID, &rel, &actorID, &meas); err != nil {
+		if err := rows.Scan(&scmID, &occurred, &eventType, &entityType, &entityBiz, &entityID, &rel, &actorID, &meas); err != nil {
 			log.Fatal(err)
+		}
+		if entityBiz == "" {
+			skipped++
+			continue
 		}
 		payload := map[string]any{}
 		_ = json.Unmarshal(meas, &payload)
 		related := map[string]any{}
 		_ = json.Unmarshal(rel, &related)
-		_, err := tracePool.Exec(ctx, `
-			INSERT INTO trace_events (occurred_at, event_type, entity_type, entity_business_id, entity_id, related_ids, source_service, payload)
-			VALUES ($1,$2,$3,$4,$5::uuid,$6,'iag-supply-chain-migration',$7)
-			ON CONFLICT DO NOTHING`,
-			occurred, eventType, entityType, entityBiz, entityID, related, payload)
-		if err == nil {
+		idempotencyKey := "scm-migrate:" + scmID
+		tag, err := tracePool.Exec(ctx, `
+			INSERT INTO trace_events (occurred_at, event_type, entity_type, entity_business_id, entity_id, related_ids, source_service, payload, idempotency_key)
+			VALUES ($1,$2,$3,$4,$5::uuid,$6,'iag-supply-chain-migration',$7,$8)
+			ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+			occurred, eventType, entityType, entityBiz, entityID, related, payload, idempotencyKey)
+		if err != nil {
+			log.Fatalf("insert event %s: %v", scmID, err)
+		}
+		if tag.RowsAffected() > 0 {
 			n++
 		}
 	}
-	log.Printf("migrated %d trace_events", n)
+	log.Printf("migrated %d trace_events (%d skipped without business id)", n, skipped)
 
 	qrRows, err := scmPool.Query(ctx, `
 		SELECT el.business_id, q.public_token, q.version, q.published_at, q.scan_count
@@ -82,11 +104,14 @@ func main() {
 		if err := qrRows.Scan(&lotBiz, &token, &version, &published, &scans); err != nil {
 			log.Fatal(err)
 		}
-		_, err := tracePool.Exec(ctx, `
+		tag, err := tracePool.Exec(ctx, `
 			INSERT INTO lot_qr_codes (lot_business_id, public_token, version, published_at, scan_count)
 			VALUES ($1,$2,$3,$4,$5) ON CONFLICT (lot_business_id) DO NOTHING`,
 			lotBiz, token, version, published, scans)
-		if err == nil {
+		if err != nil {
+			log.Fatalf("insert qr %s: %v", lotBiz, err)
+		}
+		if tag.RowsAffected() > 0 {
 			qn++
 		}
 	}

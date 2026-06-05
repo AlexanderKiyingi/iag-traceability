@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/config"
 	"iag-traceability/backend/internal/kafkabus"
 	"iag-traceability/backend/internal/middleware"
@@ -19,6 +20,7 @@ type API struct {
 	Cfg       *config.Config
 	Store     *store.Store
 	KafkaPub  *kafkabus.Publisher
+	QRCache   *cache.JSONCache
 }
 
 func (a *API) Health(c *gin.Context) {
@@ -72,6 +74,12 @@ func (a *API) RecordEvent(c *gin.Context) {
 	if err := story.ValidateEventType(body.EventType); err != nil {
 		apierr.BadRequest(c, err.Error())
 		return
+	}
+	if body.EventType == "CORRECTION" {
+		if claims, ok := middleware.PlatformClaims(c); !ok || !claims.IsSuperuser {
+			apierr.Write(c, http.StatusForbidden, apierr.CodeForbidden, "CORRECTION events require superuser")
+			return
+		}
 	}
 	if body.RelatedIDs == nil {
 		body.RelatedIDs = map[string]any{}
@@ -128,6 +136,10 @@ func (a *API) ListEvents(c *gin.Context) {
 func (a *API) PublishLotQR(c *gin.Context) {
 	lotID := c.Param("businessId")
 	if err := story.ValidateLotPublish(c.Request.Context(), a.Store, lotID); err != nil {
+		if err == story.ErrComplianceGateUnavailable {
+			apierr.Write(c, http.StatusServiceUnavailable, apierr.CodeServiceUnavailable, err.Error())
+			return
+		}
 		apierr.Write(c, http.StatusUnprocessableEntity, "COMPLIANCE_FAILED", err.Error())
 		return
 	}
@@ -139,6 +151,9 @@ func (a *API) PublishLotQR(c *gin.Context) {
 	if a.KafkaPub != nil {
 		_ = a.KafkaPub.EmitLotQRPublished(c.Request.Context(), lotID, token, publicURL)
 	}
+	if a.QRCache != nil {
+		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(token))
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"lot_business_id": lotID,
 		"public_token":    token,
@@ -146,20 +161,58 @@ func (a *API) PublishLotQR(c *gin.Context) {
 	})
 }
 
-func (a *API) PublicQR(c *gin.Context) {
-	token := c.Param("token")
-	payload, err := story.ResolvePublicQR(c.Request.Context(), a.Store, token, a.Cfg.PublicTraceBaseURL)
-	if err != nil {
+func (a *API) RevokeLotQR(c *gin.Context) {
+	lotID := c.Param("businessId")
+	qr, tokenErr := a.Store.GetLotQRByLotID(c.Request.Context(), lotID)
+	if err := a.Store.RevokeLotQR(c.Request.Context(), lotID); err != nil {
 		if err == store.ErrNotFound {
-			apierr.NotFound(c, "QR not found or revoked")
+			apierr.NotFound(c, "lot QR not found or already revoked")
 			return
 		}
-		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to resolve QR")
+		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to revoke QR")
 		return
+	}
+	if tokenErr == nil && a.QRCache != nil {
+		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(qr.PublicToken))
+	}
+	c.JSON(http.StatusOK, gin.H{"lot_business_id": lotID, "revoked": true})
+}
+
+func (a *API) PublicQR(c *gin.Context) {
+	token := c.Param("token")
+	var payload *story.PublicPayload
+	cacheKey := publicQRCacheKey(token)
+	if a.QRCache != nil {
+		err := a.QRCache.GetOrSet(c.Request.Context(), cacheKey, &payload, func() (any, error) {
+			return story.ResolvePublicQR(c.Request.Context(), a.Store, token, a.Cfg.PublicTraceBaseURL)
+		})
+		if err != nil {
+			if err == store.ErrNotFound {
+				apierr.NotFound(c, "QR not found or revoked")
+				return
+			}
+			apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to resolve QR")
+			return
+		}
+	} else {
+		var err error
+		payload, err = story.ResolvePublicQR(c.Request.Context(), a.Store, token, a.Cfg.PublicTraceBaseURL)
+		if err != nil {
+			if err == store.ErrNotFound {
+				apierr.NotFound(c, "QR not found or revoked")
+				return
+			}
+			apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to resolve QR")
+			return
+		}
 	}
 	c.Header("Cache-Control", "public, max-age=300, s-maxage=3600")
 	c.Header("Vary", "Accept-Encoding")
 	c.JSON(http.StatusOK, payload)
+}
+
+func publicQRCacheKey(token string) string {
+	return "trace:public:q:" + token
 }
 
 func (a *API) PublicQRPng(c *gin.Context) {

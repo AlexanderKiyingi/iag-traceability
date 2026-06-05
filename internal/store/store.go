@@ -96,7 +96,7 @@ func (s *Store) ListEventsForEntity(ctx context.Context, entityType, businessID 
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, occurred_at, event_type, entity_type, entity_business_id, entity_id,
-			source_service, created_at
+			source_service, related_ids, payload, created_at
 		FROM trace_events
 		WHERE entity_type = $1 AND entity_business_id = $2
 		ORDER BY occurred_at ASC
@@ -109,12 +109,15 @@ func (s *Store) ListEventsForEntity(ctx context.Context, entityType, businessID 
 	var out []TraceEvent
 	for rows.Next() {
 		var ev TraceEvent
+		var relatedIDs, payload map[string]any
 		if err := rows.Scan(
 			&ev.ID, &ev.OccurredAt, &ev.EventType, &ev.EntityType, &ev.EntityBusinessID, &ev.EntityID,
-			&ev.SourceService, &ev.CreatedAt,
+			&ev.SourceService, &relatedIDs, &payload, &ev.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
+		ev.RelatedIDs = relatedIDs
+		ev.Payload = payload
 		out = append(out, ev)
 	}
 	return out, rows.Err()
@@ -184,6 +187,58 @@ func (s *Store) UpsertStoryProjection(ctx context.Context, lotBusinessID string,
 		ON CONFLICT (lot_business_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
 		lotBusinessID, payload)
 	return err
+}
+
+func (s *Store) UpsertEntityProjection(ctx context.Context, entityType, businessID string, payload map[string]any) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO entity_projections (entity_type, entity_business_id, payload, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (entity_type, entity_business_id) DO UPDATE SET
+			payload = EXCLUDED.payload,
+			updated_at = now()`,
+		entityType, businessID, payload)
+	return err
+}
+
+func (s *Store) GetEntityProjection(ctx context.Context, entityType, businessID string) (map[string]any, error) {
+	var payload map[string]any
+	err := s.pool.QueryRow(ctx, `
+		SELECT payload FROM entity_projections
+		WHERE entity_type = $1 AND entity_business_id = $2`, entityType, businessID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return payload, err
+}
+
+func (s *Store) RevokeLotQR(ctx context.Context, lotBusinessID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE lot_qr_codes SET revoked_at = now(), updated_at = now()
+		WHERE lot_business_id = $1 AND revoked_at IS NULL`, lotBusinessID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) GetLotQRByLotID(ctx context.Context, lotBusinessID string) (LotQR, error) {
+	var qr LotQR
+	err := s.pool.QueryRow(ctx, `
+		SELECT lot_business_id, public_token, version, published_at, revoked_at, scan_count
+		FROM lot_qr_codes
+		WHERE lot_business_id = $1 AND revoked_at IS NULL`, lotBusinessID).Scan(
+		&qr.LotBusinessID, &qr.PublicToken, &qr.Version, &qr.PublishedAt, &qr.RevokedAt, &qr.ScanCount,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return qr, ErrNotFound
+	}
+	return qr, err
 }
 
 func (s *Store) Ping(ctx context.Context) error {

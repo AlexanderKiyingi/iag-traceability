@@ -3,7 +3,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alvor-technologies/iag-platform-go/corsenv"
 	"github.com/joho/godotenv"
@@ -39,6 +41,11 @@ type Config struct {
 	KafkaSupplyChainTopic string
 	KafkaProductionTopic  string
 	KafkaQualityTopic     string
+
+	PublicRateLimitPerMin float64
+	PublicRateBurst       int
+	CacheTTL              time.Duration
+	StoryPlaceholderJourney bool
 }
 
 func Load() (*Config, error) {
@@ -79,6 +86,10 @@ func Load() (*Config, error) {
 		KafkaSupplyChainTopic: getenv("KAFKA_SUPPLY_CHAIN_TOPIC", "iag.supply-chain"),
 		KafkaProductionTopic:  getenv("KAFKA_PRODUCTION_TOPIC", "iag.production"),
 		KafkaQualityTopic:     getenv("KAFKA_QUALITY_TOPIC", "iag.quality"),
+		PublicRateLimitPerMin: getEnvFloat("PUBLIC_RATE_LIMIT", 60),
+		PublicRateBurst:       getEnvInt("PUBLIC_RATE_BURST", 10),
+		CacheTTL:              getEnvDuration("CACHE_TTL", "5m"),
+		StoryPlaceholderJourney: getEnvBool("STORY_PLACEHOLDER_JOURNEY", env != "production"),
 	}
 
 	if c.DatabaseURL == "" {
@@ -106,4 +117,55 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+func getEnvDuration(key, def string) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		v = def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		d, _ = time.ParseDuration(def)
+	}
+	return d
+}
+
+func getEnvFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
+func getEnvInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func getEnvBool(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }

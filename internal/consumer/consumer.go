@@ -64,6 +64,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 		if err := c.handleMessage(ctx, msg); err != nil {
 			log.Printf("traceability consumer handle topic=%s: %v", msg.Topic, err)
+			continue
 		}
 		if err := r.CommitMessages(ctx, msg); err != nil {
 			log.Printf("traceability consumer commit: %v", err)
@@ -131,16 +132,59 @@ func (c *Consumer) projectEvent(ctx context.Context, eventType string, data map[
 	if err != nil {
 		return err
 	}
+	c.projectEntity(ctx, eventType, mappedType, entityID, data)
 	if lotID, ok := strField(data, "lot_business_id"); ok && lotID != "" {
 		c.maybeRebuildLotStory(ctx, lotID, data, mappedType)
+	} else if bid, ok := strField(data, "batch_business_id"); ok && bid != "" {
+		c.maybeRebuildLotsForBatch(ctx, bid, data, mappedType)
 	}
 	return nil
 }
 
+func (c *Consumer) maybeRebuildLotsForBatch(ctx context.Context, batchID string, data map[string]any, mappedType string) {
+	switch mappedType {
+	case "WET_MILL_STARTED", "WET_MILL_COMPLETE", "DRYING_STARTED", "DRYING_COMPLETE",
+		"DRY_MILL_COMPLETE", "SAMPLE_SUBMITTED", "LAB_RESULT_RECORDED", "CHERRY_RECEIVED":
+	default:
+		return
+	}
+	if c.scm == nil || !c.scm.Enabled() {
+		return
+	}
+	lotIDs, err := c.scm.ListLotsForBatch(ctx, batchID)
+	if err != nil || len(lotIDs) == 0 {
+		return
+	}
+	for _, lotID := range lotIDs {
+		c.maybeRebuildLotStory(ctx, lotID, data, mappedType)
+	}
+}
+
+func (c *Consumer) projectEntity(ctx context.Context, eventType, mappedType, entityID string, data map[string]any) {
+	if entityID == "" {
+		return
+	}
+	payload := map[string]any{}
+	for k, v := range data {
+		payload[k] = v
+	}
+	switch eventType {
+	case "scm.party.created", "scm.party.updated":
+		_ = c.store.UpsertEntityProjection(ctx, "party", entityID, payload)
+	case "scm.farm.registered", "scm.farm.updated":
+		_ = c.store.UpsertEntityProjection(ctx, "farm", entityID, payload)
+	case "scm.lot.assembled":
+		if mappedType == "LOT_ASSEMBLED" {
+			_ = c.store.UpsertEntityProjection(ctx, "lot", entityID, payload)
+		}
+	}
+}
+
 func (c *Consumer) maybeRebuildLotStory(ctx context.Context, lotID string, data map[string]any, mappedType string) {
 	switch mappedType {
-	case "LOT_QR_PUBLISHED", "COA_ISSUED", "LAB_RESULT_RECORDED",
-		"WET_MILL_COMPLETE", "DRYING_COMPLETE", "DRY_MILL_COMPLETE", "CHERRY_RECEIVED":
+	case "LOT_QR_PUBLISHED", "COA_ISSUED", "LAB_RESULT_RECORDED", "LOT_ASSEMBLED",
+		"WET_MILL_STARTED", "WET_MILL_COMPLETE", "DRYING_STARTED", "DRYING_COMPLETE",
+		"DRY_MILL_COMPLETE", "SAMPLE_SUBMITTED", "CHERRY_RECEIVED":
 	default:
 		return
 	}
@@ -170,6 +214,21 @@ func mapEvent(eventType string, data map[string]any) (mappedType, entityType, en
 	case "scm.party.created":
 		pid, _ := strField(data, "party_business_id")
 		return "PARTY_CREATED", "party", pid
+	case "scm.party.updated":
+		pid, _ := strField(data, "party_business_id")
+		return "PARTY_UPDATED", "party", pid
+	case "scm.farm.updated":
+		fid, _ := strField(data, "farm_business_id")
+		return "FARM_UPDATED", "farm", fid
+	case "scm.lot.assembled":
+		lid, _ := strField(data, "lot_business_id")
+		return "LOT_ASSEMBLED", "lot", lid
+	case "mes.wetmill.started":
+		bid, _ := strField(data, "batch_business_id")
+		return "WET_MILL_STARTED", "batch", bid
+	case "mes.drying.started":
+		bid, _ := strField(data, "batch_business_id")
+		return "DRYING_STARTED", "batch", bid
 	case "mes.wetmill.completed":
 		bid, _ := strField(data, "batch_business_id")
 		return "WET_MILL_COMPLETE", "batch", bid
@@ -182,6 +241,9 @@ func mapEvent(eventType string, data map[string]any) (mappedType, entityType, en
 	case "qc.lab.result_recorded":
 		bid, _ := strField(data, "batch_business_id")
 		return "LAB_RESULT_RECORDED", "batch", bid
+	case "qc.sample.submitted":
+		bid, _ := strField(data, "batch_business_id")
+		return "SAMPLE_SUBMITTED", "batch", bid
 	case "qc.coa.issued":
 		lid, _ := strField(data, "lot_business_id")
 		return "COA_ISSUED", "lot", lid

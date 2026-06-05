@@ -146,3 +146,44 @@ func (c *Client) ValidateLotPublish(ctx context.Context, lotBusinessID string) e
 	}
 	return nil
 }
+
+// ListLotsForBatch returns export lot business IDs that include the batch.
+func (c *Client) ListLotsForBatch(ctx context.Context, batchBusinessID string) ([]string, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("scm client disabled")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/export-lots", nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.auth != nil {
+		if err := c.auth.AuthorizeRequest(ctx, req); err != nil {
+			return nil, err
+		}
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("scm %s: %s", resp.Status, string(b))
+	}
+	var wrap struct {
+		Data []ExportLot `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrap); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, lot := range wrap.Data {
+		for _, bid := range lot.BatchIDs {
+			if bid == batchBusinessID {
+				out = append(out, lot.BusinessID)
+				break
+			}
+		}
+	}
+	return out, nil
+}

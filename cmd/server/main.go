@@ -11,6 +11,7 @@ import (
 
 	"github.com/alvor-technologies/iag-platform-go/authclient"
 
+	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/config"
 	"iag-traceability/backend/internal/consumer"
 	"iag-traceability/backend/internal/db"
@@ -49,6 +50,16 @@ func main() {
 		cfg.ServiceClientID, cfg.ServiceClientSecret, cfg.SupplyChainAudience,
 	)
 	story.SetSCMClient(scm)
+	story.SetOptions(story.Options{PlaceholderJourney: cfg.StoryPlaceholderJourney})
+
+	var qrCache *cache.JSONCache
+	if cfg.RedisURL != "" {
+		if rdb, err := cache.NewClient(cfg.RedisURL); err != nil {
+			log.Printf("traceability: redis unavailable (%v) — public QR cache disabled", err)
+		} else {
+			qrCache = cache.NewJSONCache(rdb, cfg.CacheTTL)
+		}
+	}
 
 	var verifier *authclient.Verifier
 	if cfg.AuthMode == "jwt" {
@@ -96,10 +107,14 @@ func main() {
 		Cfg:      cfg,
 		Store:    st,
 		KafkaPub: kafkabus.NewPublisher(cfg.KafkaBrokers, cfg.KafkaClientID),
+		QRCache:  qrCache,
 	}
 	router := handlers.NewRouter(handlers.RouterDeps{
-		API:          api,
-		PlatformAuth: platformAuth,
+		API:              api,
+		PlatformAuth:     platformAuth,
+		CORSOrigins:      cfg.CORSOrigins,
+		PublicRatePerMin: cfg.PublicRateLimitPerMin,
+		PublicRateBurst:  cfg.PublicRateBurst,
 	})
 
 	srv := &http.Server{

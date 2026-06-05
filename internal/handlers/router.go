@@ -11,8 +11,11 @@ import (
 )
 
 type RouterDeps struct {
-	API          *API
-	PlatformAuth *appmw.PlatformAuth
+	API               *API
+	PlatformAuth      *appmw.PlatformAuth
+	CORSOrigins       []string
+	PublicRatePerMin  float64
+	PublicRateBurst   int
 }
 
 func NewRouter(deps RouterDeps) *gin.Engine {
@@ -21,7 +24,7 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestID())
 	r.Use(securityHeaders())
-	r.Use(corsMiddleware())
+	r.Use(corsMiddleware(deps.CORSOrigins))
 
 	api := deps.API
 	if deps.PlatformAuth != nil {
@@ -33,6 +36,7 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 	r.GET("/ready", api.Ready)
 
 	public := r.Group("/public")
+	public.Use(appmw.PublicRateLimit(deps.PublicRatePerMin, deps.PublicRateBurst))
 	{
 		public.GET("/q/:token", api.PublicQR)
 		public.GET("/q/:token/qr.png", api.PublicQRPng)
@@ -47,6 +51,7 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 		v1.GET("/events", appmw.RequirePermission("traceability.view_events"), api.ListEvents)
 		v1.POST("/events", appmw.RequirePermission("traceability.add_trace_event"), api.RecordEvent)
 		v1.POST("/lots/:businessId/publish", appmw.RequirePermission("traceability.publish_qr"), api.PublishLotQR)
+		v1.POST("/lots/:businessId/revoke", appmw.RequirePermission("traceability.publish_qr"), api.RevokeLotQR)
 	}
 
 	return r
@@ -61,33 +66,26 @@ func securityHeaders() gin.HandlerFunc {
 	}
 }
 
-func corsMiddleware() gin.HandlerFunc {
+func corsMiddleware(allowed []string) gin.HandlerFunc {
+	allowSet := map[string]bool{}
+	for _, o := range allowed {
+		if t := strings.TrimSpace(o); t != "" {
+			allowSet[t] = true
+		}
+	}
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
-		if origin != "" {
+		if origin != "" && allowSet[origin] {
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Vary", "Origin")
+			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
 		}
-		c.Header("Access-Control-Allow-Credentials", "true")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
 		c.Next()
 	}
-}
-
-func splitOrigins(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
 }
