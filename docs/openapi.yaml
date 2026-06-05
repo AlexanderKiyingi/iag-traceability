@@ -62,6 +62,20 @@ paths:
       responses:
         "200":
           description: QR revoked
+  /api/v1/admin/audit-logs:
+    get:
+      summary: List HTTP API audit entries
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        "200":
+          description: Paginated audit log rows
   /public/q/{token}:
     get:
       summary: Public coffee story (QR payload v2)

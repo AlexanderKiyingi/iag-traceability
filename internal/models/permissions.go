@@ -12,5 +12,6 @@ func PermissionDescriptors() []PermissionDescriptor {
 		{"traceability.add_trace_event", "Append custody trace events"},
 		{"traceability.publish_qr", "Publish or revoke public lot QR codes"},
 		{"traceability.view_events", "List trace events (internal)"},
+		{"audit.view_api_log", "Read HTTP audit entries"},
 	}
 }

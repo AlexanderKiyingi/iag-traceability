@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"iag-traceability/backend/internal/auditlog"
 	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/config"
 	"iag-traceability/backend/internal/kafkabus"
@@ -19,6 +20,7 @@ import (
 type API struct {
 	Cfg       *config.Config
 	Store     *store.Store
+	Audit     *auditlog.Store
 	KafkaPub  *kafkabus.Publisher
 	QRCache   *cache.JSONCache
 }

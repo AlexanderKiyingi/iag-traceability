@@ -7,11 +7,13 @@ import (
 	"github.com/alvor-technologies/iag-platform-go/middleware"
 	"github.com/gin-gonic/gin"
 
+	"iag-traceability/backend/internal/auditlog"
 	appmw "iag-traceability/backend/internal/middleware"
 )
 
 type RouterDeps struct {
 	API               *API
+	Audit             *auditlog.Store
 	PlatformAuth      *appmw.PlatformAuth
 	CORSOrigins       []string
 	PublicRatePerMin  float64
@@ -30,6 +32,7 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 	if deps.PlatformAuth != nil {
 		r.Use(deps.PlatformAuth.AttachPrincipal())
 	}
+	r.Use(appmw.RequestAudit(deps.Audit))
 
 	r.GET("/health", api.Health)
 	r.GET("/healthz", api.Health)
@@ -52,6 +55,8 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 		v1.POST("/events", appmw.RequirePermission("traceability.add_trace_event"), api.RecordEvent)
 		v1.POST("/lots/:businessId/publish", appmw.RequirePermission("traceability.publish_qr"), api.PublishLotQR)
 		v1.POST("/lots/:businessId/revoke", appmw.RequirePermission("traceability.publish_qr"), api.RevokeLotQR)
+
+		v1.GET("/admin/audit-logs", appmw.RequirePermission("audit.view_api_log"), api.ListAPIAuditLogs)
 	}
 
 	return r

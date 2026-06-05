@@ -12,6 +12,7 @@ import (
 	"github.com/alvor-technologies/iag-platform-go/authclient"
 
 	"iag-traceability/backend/internal/cache"
+	"iag-traceability/backend/internal/auditlog"
 	"iag-traceability/backend/internal/config"
 	"iag-traceability/backend/internal/consumer"
 	"iag-traceability/backend/internal/db"
@@ -44,6 +45,7 @@ func main() {
 	}
 
 	st := store.New(pool)
+	auditStore := auditlog.NewStore(pool)
 
 	scm := scmclient.New(
 		cfg.SupplyChainBaseURL, cfg.AuthTokenURL,
@@ -106,11 +108,13 @@ func main() {
 	api := &handlers.API{
 		Cfg:      cfg,
 		Store:    st,
+		Audit:    auditStore,
 		KafkaPub: kafkabus.NewPublisher(cfg.KafkaBrokers, cfg.KafkaClientID),
 		QRCache:  qrCache,
 	}
 	router := handlers.NewRouter(handlers.RouterDeps{
 		API:              api,
+		Audit:            auditStore,
 		PlatformAuth:     platformAuth,
 		CORSOrigins:      cfg.CORSOrigins,
 		PublicRatePerMin: cfg.PublicRateLimitPerMin,
