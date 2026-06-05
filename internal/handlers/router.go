@@ -56,7 +56,13 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 		v1.POST("/lots/:businessId/publish", appmw.RequirePermission("traceability.publish_qr"), api.PublishLotQR)
 		v1.POST("/lots/:businessId/revoke", appmw.RequirePermission("traceability.publish_qr"), api.RevokeLotQR)
 
-		v1.GET("/admin/audit-logs", appmw.RequirePermission("audit.view_api_log"), api.ListAPIAuditLogs)
+		admin := v1.Group("/admin")
+		admin.Use(appmw.RequirePermission("audit.view_api_log"))
+		{
+			admin.GET("/audit-logs", api.ListAPIAuditLogs)
+			admin.GET("/monitoring/summary", api.AdminMonitoringSummary)
+			admin.GET("/monitoring/activity", api.AdminMonitoringActivity)
+		}
 	}
 
 	return r

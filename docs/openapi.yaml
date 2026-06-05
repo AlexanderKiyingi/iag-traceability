@@ -76,6 +76,22 @@ paths:
       responses:
         "200":
           description: Paginated audit log rows
+  /api/v1/admin/monitoring/summary:
+    get:
+      summary: Admin monitoring summary (24h API stats + domain counts)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Monitoring summary
+  /api/v1/admin/monitoring/activity:
+    get:
+      summary: Recent HTTP API activity
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Recent audit rows
   /public/q/{token}:
     get:
       summary: Public coffee story (QR payload v2)
