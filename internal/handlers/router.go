@@ -6,6 +6,7 @@ import (
 
 	"github.com/alvor-technologies/iag-platform-go/middleware"
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
 	"iag-traceability/backend/internal/auditlog"
 	appmw "iag-traceability/backend/internal/middleware"
@@ -23,6 +24,7 @@ type RouterDeps struct {
 func NewRouter(deps RouterDeps) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	r.Use(otelgin.Middleware(deps.API.Cfg.ServiceName))
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestID())
 	r.Use(securityHeaders())

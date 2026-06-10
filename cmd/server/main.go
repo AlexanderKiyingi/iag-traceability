@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alvor-technologies/iag-platform-go/authclient"
+	platformotel "github.com/alvor-technologies/iag-platform-go/otel"
 
 	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/auditlog"
@@ -30,6 +31,20 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+
+	// OpenTelemetry → otel-collector:4317 (non-blocking dial).
+	if tp, err := platformotel.Init(ctx, platformotel.Config{
+		ServiceName: cfg.ServiceName,
+		Environment: cfg.Environment,
+	}); err != nil {
+		log.Printf("otel disabled: %v", err)
+	} else {
+		defer func() {
+			sc, c := context.WithTimeout(context.Background(), 5*time.Second)
+			defer c()
+			_ = tp.Shutdown(sc)
+		}()
 	}
 
 	pool, err := db.NewPool(ctx, cfg.DatabaseURL)
