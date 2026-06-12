@@ -11,5 +11,7 @@ fi
 rm -rf "$DEST"
 mkdir -p "$(dirname "$DEST")"
 cp -R "$SRC" "$DEST"
-(cd "$ROOT" && go mod edit -replace=github.com/alvor-technologies/iag-platform-go=./third_party/platform-go)
+# Do NOT rewrite go.mod's replace here: it stays pointed at the meta-repo path
+# (../../../shared/platform-go) so in-monorepo `go build` works. The Dockerfile
+# overrides the replace to /deps/platform-go at build time for standalone images.
 echo "synced platform-go to $DEST"

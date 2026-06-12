@@ -2,4 +2,3 @@
 *.exe
 *.test
 /bin/
-/third_party/platform-go/
