@@ -33,7 +33,27 @@ func (a *API) AdminMonitoringSummary(c *gin.Context) {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "monitoring failed")
 		return
 	}
+	// In-process consumer counters (since-boot) complement the DB-derived
+	// totals: they reveal live ingest failures/dead-letters even before any
+	// row is written.
+	if a.ConsumerMetrics != nil {
+		summary["consumer"] = a.ConsumerMetrics.Snapshot()
+	}
 	c.JSON(http.StatusOK, summary)
+}
+
+func (a *API) AdminDeadLetters(c *gin.Context) {
+	if a.Audit == nil {
+		apierr.Write(c, http.StatusServiceUnavailable, apierr.CodeServiceUnavailable, "audit log not configured")
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	items, err := a.Audit.RecentDeadLetters(c.Request.Context(), limit)
+	if err != nil {
+		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "dead-letter list failed")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 func (a *API) AdminMonitoringActivity(c *gin.Context) {

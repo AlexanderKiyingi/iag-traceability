@@ -99,5 +99,50 @@ func (s *Store) MonitoringSummary(ctx context.Context, kafkaEnabled bool) (map[s
 	summary["active_qr_codes"] = activeQR
 	summary["kafka_consumer_enabled"] = kafkaEnabled
 	summary["database"] = true
+
+	// Ingest-health signals: total public scans, deduped events seen, and
+	// dead-lettered (unmapped) events — the latter surfaces upstream contract
+	// drift that was previously written to a table nothing read.
+	var totalScans int64
+	_ = s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(scan_count), 0)::bigint FROM lot_qr_codes`).Scan(&totalScans)
+	summary["total_qr_scans"] = totalScans
+
+	var dedupeCount, deadLetterCount int
+	_ = s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM kafka_dedupe`).Scan(&dedupeCount)
+	_ = s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM kafka_dead_letter`).Scan(&deadLetterCount)
+	summary["kafka_events_seen"] = dedupeCount
+	summary["kafka_dead_letters"] = deadLetterCount
+
 	return summary, nil
+}
+
+// RecentDeadLetters returns the most recent dead-lettered (unmapped) events so
+// operators can see exactly which upstream event types are being dropped.
+func (s *Store) RecentDeadLetters(ctx context.Context, limit int) ([]map[string]any, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, topic, event_type, reason, received_at
+		FROM kafka_dead_letter ORDER BY received_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var eventID, topic, eventType, reason string
+		var at time.Time
+		if err := rows.Scan(&eventID, &topic, &eventType, &reason, &at); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"event_id":    eventID,
+			"topic":       topic,
+			"event_type":  eventType,
+			"reason":      reason,
+			"received_at": at,
+		})
+	}
+	return out, rows.Err()
 }

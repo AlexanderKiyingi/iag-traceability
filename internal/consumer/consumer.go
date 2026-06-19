@@ -9,6 +9,7 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
+	"iag-traceability/backend/internal/metrics"
 	"iag-traceability/backend/internal/scmclient"
 	"iag-traceability/backend/internal/store"
 	"iag-traceability/backend/internal/story"
@@ -23,14 +24,25 @@ type Config struct {
 	QualityTopic     string
 }
 
-type Consumer struct {
-	cfg   Config
-	store *store.Store
-	scm   *scmclient.Client
+// StoryPublisher emits the lot story-updated event. Satisfied by
+// *kafkabus.Publisher; an interface here keeps the consumer decoupled/testable.
+type StoryPublisher interface {
+	EmitLotStoryUpdated(ctx context.Context, lotBusinessID string) error
 }
 
-func New(cfg Config, st *store.Store, scm *scmclient.Client) *Consumer {
-	return &Consumer{cfg: cfg, store: st, scm: scm}
+type Consumer struct {
+	cfg     Config
+	store   *store.Store
+	scm     *scmclient.Client
+	metrics *metrics.Counters
+	pub     StoryPublisher
+}
+
+func New(cfg Config, st *store.Store, scm *scmclient.Client, m *metrics.Counters, pub StoryPublisher) *Consumer {
+	if m == nil {
+		m = metrics.New()
+	}
+	return &Consumer{cfg: cfg, store: st, scm: scm, metrics: m, pub: pub}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
@@ -63,6 +75,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		}
 		if err := c.handleMessage(ctx, msg); err != nil {
+			c.metrics.IncFailed()
 			log.Printf("traceability consumer handle topic=%s: %v", msg.Topic, err)
 			continue
 		}
@@ -94,32 +107,54 @@ func (c *Consumer) handleMessage(ctx context.Context, msg kafka.Message) error {
 			eventID = eventID[:128]
 		}
 	}
-	tag, err := c.store.Pool().Exec(ctx, `
-		INSERT INTO kafka_dedupe (event_id, topic) VALUES ($1, $2)
-		ON CONFLICT (event_id) DO NOTHING`, eventID, msg.Topic)
-	if err != nil {
+
+	// Dedupe is a read-then-mark, not an insert-up-front: we only record the
+	// event as seen AFTER projection succeeds. Inserting up front meant a
+	// projection failure (which doesn't commit the Kafka offset) would be
+	// permanently skipped on redelivery because the dedupe row already
+	// existed. The single consumer-per-partition guarantee makes the
+	// check-then-act safe; AppendEvent's idempotency key is the backstop.
+	var seen bool
+	if err := c.store.Pool().QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM kafka_dedupe WHERE event_id = $1)`, eventID,
+	).Scan(&seen); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if seen {
+		c.metrics.IncDeduped()
 		return nil
 	}
+	c.metrics.IncConsumed()
 
 	eventType := env.Type
 	if eventType == "" {
 		eventType = string(msg.Key)
 	}
-	return c.projectEvent(ctx, eventType, env.Data)
+	if err := c.projectEvent(ctx, eventID, eventType, msg.Topic, env.Data); err != nil {
+		return err
+	}
+
+	_, err := c.store.Pool().Exec(ctx, `
+		INSERT INTO kafka_dedupe (event_id, topic) VALUES ($1, $2)
+		ON CONFLICT (event_id) DO NOTHING`, eventID, msg.Topic)
+	return err
 }
 
-func (c *Consumer) projectEvent(ctx context.Context, eventType string, data map[string]any) error {
+func (c *Consumer) projectEvent(ctx context.Context, eventID, eventType, topic string, data map[string]any) error {
 	if data == nil {
 		data = map[string]any{}
 	}
 	occurred := time.Now().UTC()
 	mappedType, entityType, entityID := mapEvent(eventType, data)
 	if mappedType == "" {
+		// Unrecognized event type: dead-letter it instead of silently
+		// dropping, so upstream contract drift is visible. Returning nil
+		// lets the caller mark it deduped (no infinite reprocessing).
+		log.Printf("traceability consumer: unmapped event type=%q topic=%s — dead-lettering", eventType, topic)
+		c.deadLetter(ctx, eventID, topic, eventType, "unmapped_event_type", data)
 		return nil
 	}
+	idemKey := eventID
 	_, err := c.store.AppendEvent(ctx, store.AppendEventInput{
 		OccurredAt:       occurred,
 		EventType:        mappedType,
@@ -128,10 +163,12 @@ func (c *Consumer) projectEvent(ctx context.Context, eventType string, data map[
 		SourceService:    sourceFor(eventType),
 		RelatedIDs:       data,
 		Payload:          data,
+		IdempotencyKey:   &idemKey,
 	})
 	if err != nil {
 		return err
 	}
+	c.metrics.IncProjected()
 	c.projectEntity(ctx, eventType, mappedType, entityID, data)
 	if lotID, ok := strField(data, "lot_business_id"); ok && lotID != "" {
 		c.maybeRebuildLotStory(ctx, lotID, data, mappedType)
@@ -144,7 +181,8 @@ func (c *Consumer) projectEvent(ctx context.Context, eventType string, data map[
 func (c *Consumer) maybeRebuildLotsForBatch(ctx context.Context, batchID string, data map[string]any, mappedType string) {
 	switch mappedType {
 	case "WET_MILL_STARTED", "WET_MILL_COMPLETE", "DRYING_STARTED", "DRYING_COMPLETE",
-		"DRY_MILL_COMPLETE", "SAMPLE_SUBMITTED", "LAB_RESULT_RECORDED", "CHERRY_RECEIVED":
+		"DRY_MILL_COMPLETE", "SAMPLE_SUBMITTED", "LAB_RESULT_RECORDED", "CHERRY_RECEIVED",
+		"STAGE_CHANGED":
 	default:
 		return
 	}
@@ -181,11 +219,7 @@ func (c *Consumer) projectEntity(ctx context.Context, eventType, mappedType, ent
 }
 
 func (c *Consumer) maybeRebuildLotStory(ctx context.Context, lotID string, data map[string]any, mappedType string) {
-	switch mappedType {
-	case "LOT_QR_PUBLISHED", "COA_ISSUED", "LAB_RESULT_RECORDED", "LOT_ASSEMBLED",
-		"WET_MILL_STARTED", "WET_MILL_COMPLETE", "DRYING_STARTED", "DRYING_COMPLETE",
-		"DRY_MILL_COMPLETE", "SAMPLE_SUBMITTED", "CHERRY_RECEIVED":
-	default:
+	if !story.AffectsLotStory(mappedType) {
 		return
 	}
 	publicURL := ""
@@ -193,7 +227,11 @@ func (c *Consumer) maybeRebuildLotStory(ctx context.Context, lotID string, data 
 		publicURL = u
 	}
 	if composed, err := story.RebuildLotProjection(ctx, c.store, c.scm, lotID, publicURL); err == nil {
-		_ = c.store.UpsertStoryProjection(ctx, lotID, composed)
+		if err := c.store.UpsertStoryProjection(ctx, lotID, composed); err == nil && c.pub != nil {
+			if emitErr := c.pub.EmitLotStoryUpdated(ctx, lotID); emitErr != nil {
+				log.Printf("traceability consumer: emit story_updated lot=%s: %v", lotID, emitErr)
+			}
+		}
 	}
 }
 
@@ -250,6 +288,26 @@ func mapEvent(eventType string, data map[string]any) (mappedType, entityType, en
 	default:
 		return "", "", ""
 	}
+}
+
+// deadLetter records an event the consumer could not handle. Best-effort:
+// a dead-letter write failure must not block the consumer, so the error is
+// logged and swallowed.
+func (c *Consumer) deadLetter(ctx context.Context, eventID, topic, eventType, reason string, data map[string]any) {
+	if data == nil {
+		data = map[string]any{}
+	}
+	// ON CONFLICT keeps the table free of duplicates if the same event is
+	// redelivered before its kafka_dedupe row commits (e.g. a crash between
+	// the dead-letter write and the dedupe mark). Matches the partial unique
+	// index on non-empty event_id in migration 004.
+	if _, err := c.store.Pool().Exec(ctx, `
+		INSERT INTO kafka_dead_letter (event_id, topic, event_type, reason, payload)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (event_id) WHERE event_id <> '' DO NOTHING`, eventID, topic, eventType, reason, data); err != nil {
+		log.Printf("traceability consumer: dead-letter write failed event_id=%s: %v", eventID, err)
+	}
+	c.metrics.IncDeadLettered()
 }
 
 func sourceFor(eventType string) string {

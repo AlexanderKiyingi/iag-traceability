@@ -8,6 +8,43 @@ import (
 	"iag-traceability/backend/internal/store"
 )
 
+// lotStoryEventTypes are the mapped event types whose arrival should refresh a
+// lot's composed story projection. Shared by the Kafka consumer and the manual
+// HTTP record-event path so both stay consistent.
+var lotStoryEventTypes = map[string]bool{
+	"LOT_QR_PUBLISHED":    true,
+	"COA_ISSUED":          true,
+	"LAB_RESULT_RECORDED": true,
+	"LOT_ASSEMBLED":       true,
+	"WET_MILL_STARTED":    true,
+	"WET_MILL_COMPLETE":   true,
+	"DRYING_STARTED":      true,
+	"DRYING_COMPLETE":     true,
+	"DRY_MILL_COMPLETE":   true,
+	"SAMPLE_SUBMITTED":    true,
+	"CHERRY_RECEIVED":     true,
+	"STAGE_CHANGED":       true,
+}
+
+// AffectsLotStory reports whether an event of the given mapped type should
+// trigger a lot story rebuild.
+func AffectsLotStory(mappedType string) bool {
+	return lotStoryEventTypes[mappedType]
+}
+
+// RebuildStoredLot recomposes a lot's story (using the configured SCM client)
+// and persists it. Returns true if the projection was rebuilt and stored.
+func RebuildStoredLot(ctx context.Context, st *store.Store, lotBusinessID, publicURL string) (bool, error) {
+	composed, err := RebuildLotProjection(ctx, st, scmFetcher, lotBusinessID, publicURL)
+	if err != nil {
+		return false, err
+	}
+	if err := st.UpsertStoryProjection(ctx, lotBusinessID, composed); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // RebuildLotProjection composes a public coffee story from trace events + SCM lot snapshot.
 func RebuildLotProjection(ctx context.Context, st *store.Store, scm *scmclient.Client, lotBusinessID, publicURL string) (map[string]any, error) {
 	story := map[string]any{
@@ -36,12 +73,24 @@ func RebuildLotProjection(ctx context.Context, st *store.Store, scm *scmclient.C
 	}
 
 	events, _ := st.ListEventsForEntity(ctx, "lot", lotBusinessID, 100)
-	if len(events) == 0 {
-		// Aggregate batch events linked to lot batches when lot entity events sparse.
-		if batchIDs, ok := story["lot"].(map[string]any)["batch_ids"].([]string); ok {
-			for _, bid := range batchIDs {
-				batchEv, _ := st.ListEventsForEntity(ctx, "batch", bid, 50)
-				events = append(events, batchEv...)
+	// Always aggregate events from the lot's constituent batches, not only
+	// when the lot has no events of its own. Quality data (LAB_RESULT_RECORDED,
+	// CHERRY_RECEIVED, mill stages) is recorded against the *batch* entity, so
+	// skipping this whenever the lot had any event of its own silently dropped
+	// moisture/cup-score/grade from the public story in the common case.
+	seenEvent := map[string]bool{}
+	for _, ev := range events {
+		seenEvent[ev.ID.String()] = true
+	}
+	if lotMap, ok := story["lot"].(map[string]any); ok {
+		for _, bid := range batchIDsFromLot(lotMap["batch_ids"]) {
+			batchEv, _ := st.ListEventsForEntity(ctx, "batch", bid, 50)
+			for _, ev := range batchEv {
+				if seenEvent[ev.ID.String()] {
+					continue
+				}
+				seenEvent[ev.ID.String()] = true
+				events = append(events, ev)
 			}
 		}
 	}
@@ -55,6 +104,26 @@ func RebuildLotProjection(ctx context.Context, st *store.Store, scm *scmclient.C
 	enrichFarmersFromProjections(ctx, st, story, events)
 	enrichProductFromEvents(story, events)
 	return story, nil
+}
+
+// batchIDsFromLot extracts batch business IDs from a lot map's "batch_ids"
+// field, tolerating both a native []string (from GetExportLot) and a
+// JSON-decoded []any (from an SCM preview/snapshot).
+func batchIDsFromLot(v any) []string {
+	switch ids := v.(type) {
+	case []string:
+		return ids
+	case []any:
+		out := make([]string, 0, len(ids))
+		for _, e := range ids {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func enrichFarmsFromProjections(ctx context.Context, st *store.Store, story map[string]any, events []store.TraceEvent) {

@@ -18,14 +18,12 @@ func ValidateLotPublish(ctx context.Context, st *store.Store, lotBusinessID stri
 		}
 		return nil
 	}
-	events, err := st.ListEventsForEntity(ctx, "lot", lotBusinessID, 50)
+	hasCoA, err := st.LotHasCOA(ctx, lotBusinessID)
 	if err != nil {
 		return err
 	}
-	for _, ev := range events {
-		if ev.EventType == "COA_ISSUED" || ev.EventType == "qc.coa.issued" {
-			return nil
-		}
+	if hasCoA {
+		return nil
 	}
 	return ErrCoARequired
 }

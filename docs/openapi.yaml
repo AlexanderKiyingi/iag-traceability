@@ -92,6 +92,20 @@ paths:
       responses:
         "200":
           description: Recent audit rows
+  /api/v1/admin/monitoring/dead-letters:
+    get:
+      summary: Recent dead-lettered (unmapped) Kafka events
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: Recent dead-letter rows (event_id, topic, event_type, reason, received_at)
   /public/q/{token}:
     get:
       summary: Public coffee story (QR payload v2)
@@ -104,6 +118,23 @@ paths:
       responses:
         "200":
           description: Public story JSON (Cache-Control public)
+  /public/q/{token}/qr.png:
+    get:
+      summary: Public QR code image (PNG) encoding the story URL
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: PNG image of the QR code
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
 components:
   securitySchemes:
     bearerAuth:

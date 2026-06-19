@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alvor-technologies/iag-platform-go/authclient"
+	platformotel "github.com/alvor-technologies/iag-platform-go/otel"
 
 	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/auditlog"
@@ -18,6 +19,7 @@ import (
 	"iag-traceability/backend/internal/db"
 	"iag-traceability/backend/internal/handlers"
 	"iag-traceability/backend/internal/kafkabus"
+	"iag-traceability/backend/internal/metrics"
 	"iag-traceability/backend/internal/middleware"
 	"iag-traceability/backend/internal/migrate"
 	"iag-traceability/backend/internal/scmclient"
@@ -30,6 +32,24 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+
+	// OpenTelemetry tracing → otel-collector:4317 (non-blocking dial, so a
+	// missing/late collector never blocks boot). Degrade to a no-op tracer on
+	// error rather than failing startup; tracing is observability, not
+	// correctness. Brings traceability in line with the platform-wide OTel
+	// uniformity (every other service initializes this).
+	if tp, oerr := platformotel.Init(ctx, platformotel.Config{
+		ServiceName: "iag-traceability",
+		Environment: cfg.Environment,
+	}); oerr != nil {
+		log.Printf("traceability: otel disabled (%v)", oerr)
+	} else {
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = tp.Shutdown(shutCtx)
+		}()
 	}
 
 	pool, err := db.NewPool(ctx, cfg.DatabaseURL)
@@ -90,6 +110,8 @@ func main() {
 		log.Printf("traceability: SERVICE_CLIENT_SECRET unset — skipping permissions registration")
 	}
 
+	kafkaPub := kafkabus.NewPublisher(cfg.KafkaBrokers, cfg.KafkaClientID)
+	consumerMetrics := metrics.New()
 	if len(cfg.KafkaBrokers) > 0 {
 		kc := consumer.New(consumer.Config{
 			Brokers:          cfg.KafkaBrokers,
@@ -97,7 +119,7 @@ func main() {
 			SupplyChainTopic: cfg.KafkaSupplyChainTopic,
 			ProductionTopic:  cfg.KafkaProductionTopic,
 			QualityTopic:     cfg.KafkaQualityTopic,
-		}, st, scm)
+		}, st, scm, consumerMetrics, kafkaPub)
 		go func() {
 			if err := kc.Run(ctx); err != nil {
 				log.Printf("kafka consumer stopped: %v", err)
@@ -106,11 +128,12 @@ func main() {
 	}
 
 	api := &handlers.API{
-		Cfg:      cfg,
-		Store:    st,
-		Audit:    auditStore,
-		KafkaPub: kafkabus.NewPublisher(cfg.KafkaBrokers, cfg.KafkaClientID),
-		QRCache:  qrCache,
+		Cfg:             cfg,
+		Store:           st,
+		Audit:           auditStore,
+		KafkaPub:        kafkaPub,
+		QRCache:         qrCache,
+		ConsumerMetrics: consumerMetrics,
 	}
 	router := handlers.NewRouter(handlers.RouterDeps{
 		API:              api,

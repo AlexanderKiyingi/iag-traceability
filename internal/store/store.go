@@ -33,7 +33,6 @@ type TraceEvent struct {
 	EntityID         *uuid.UUID
 	RelatedIDs       map[string]any
 	ActorUserID      *uuid.UUID
-	ActorPartyID     *uuid.UUID
 	SourceService    string
 	Payload          map[string]any
 	IdempotencyKey   *string
@@ -48,7 +47,6 @@ type AppendEventInput struct {
 	EntityID         *uuid.UUID
 	RelatedIDs       map[string]any
 	ActorUserID      *uuid.UUID
-	ActorPartyID     *uuid.UUID
 	SourceService    string
 	Payload          map[string]any
 	IdempotencyKey   *string
@@ -72,14 +70,14 @@ func (s *Store) AppendEvent(ctx context.Context, in AppendEventInput) (TraceEven
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO trace_events (
 			occurred_at, event_type, entity_type, entity_business_id, entity_id,
-			related_ids, actor_user_id, actor_party_id, source_service, payload, idempotency_key
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			related_ids, actor_user_id, source_service, payload, idempotency_key
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 		RETURNING id, occurred_at, event_type, entity_type, entity_business_id, entity_id,
 			source_service, created_at`,
 		in.OccurredAt, in.EventType, in.EntityType, in.EntityBusinessID, in.EntityID,
-		in.RelatedIDs, in.ActorUserID, in.ActorPartyID, in.SourceService, in.Payload, in.IdempotencyKey,
+		in.RelatedIDs, in.ActorUserID, in.SourceService, in.Payload, in.IdempotencyKey,
 	).Scan(
 		&ev.ID, &ev.OccurredAt, &ev.EventType, &ev.EntityType, &ev.EntityBusinessID, &ev.EntityID,
 		&ev.SourceService, &ev.CreatedAt,
@@ -239,6 +237,25 @@ func (s *Store) GetLotQRByLotID(ctx context.Context, lotBusinessID string) (LotQ
 		return qr, ErrNotFound
 	}
 	return qr, err
+}
+
+// LotHasCOA reports whether a Certificate of Analysis has been issued for the
+// lot. A CoA event is normally projected onto the "lot" entity, but it may
+// instead arrive referencing the lot via related_ids (e.g. issued against a
+// batch). The local compliance gate uses this so it doesn't wrongly block a
+// publish just because the CoA wasn't projected onto the lot entity directly.
+func (s *Store) LotHasCOA(ctx context.Context, lotBusinessID string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM trace_events
+			WHERE event_type IN ('COA_ISSUED', 'qc.coa.issued')
+			  AND (
+			    (entity_type = 'lot' AND entity_business_id = $1)
+			    OR related_ids->>'lot_business_id' = $1
+			  )
+		)`, lotBusinessID).Scan(&exists)
+	return exists, err
 }
 
 func (s *Store) Ping(ctx context.Context) error {

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -12,17 +13,19 @@ import (
 	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/config"
 	"iag-traceability/backend/internal/kafkabus"
+	"iag-traceability/backend/internal/metrics"
 	"iag-traceability/backend/internal/middleware"
 	"iag-traceability/backend/internal/store"
 	"iag-traceability/backend/internal/story"
 )
 
 type API struct {
-	Cfg       *config.Config
-	Store     *store.Store
-	Audit     *auditlog.Store
-	KafkaPub  *kafkabus.Publisher
-	QRCache   *cache.JSONCache
+	Cfg             *config.Config
+	Store           *store.Store
+	Audit           *auditlog.Store
+	KafkaPub        *kafkabus.Publisher
+	QRCache         *cache.JSONCache
+	ConsumerMetrics *metrics.Counters
 }
 
 func (a *API) Health(c *gin.Context) {
@@ -117,7 +120,32 @@ func (a *API) RecordEvent(c *gin.Context) {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to append event")
 		return
 	}
+	// Refresh the cached lot story so a manually-recorded event (e.g. a CoA or
+	// lab result correction) is reflected without waiting for the next live
+	// public fetch — parity with the Kafka consumer path.
+	a.maybeRebuildLotStory(c.Request.Context(), body.EventType, body.EntityType, body.EntityBusinessID, body.RelatedIDs)
 	c.JSON(http.StatusCreated, ev)
+}
+
+// maybeRebuildLotStory recomposes and persists the affected lot's story
+// projection (and emits scm.lot.story_updated) when a recorded event warrants
+// it. Best-effort: failures are swallowed so they never fail the write.
+func (a *API) maybeRebuildLotStory(ctx context.Context, eventType, entityType, entityBusinessID string, related map[string]any) {
+	if !story.AffectsLotStory(eventType) {
+		return
+	}
+	lotID := ""
+	if entityType == "lot" {
+		lotID = entityBusinessID
+	} else if v, ok := related["lot_business_id"].(string); ok {
+		lotID = v
+	}
+	if lotID == "" {
+		return
+	}
+	if ok, err := story.RebuildStoredLot(ctx, a.Store, lotID, ""); err == nil && ok && a.KafkaPub != nil {
+		_ = a.KafkaPub.EmitLotStoryUpdated(ctx, lotID)
+	}
 }
 
 func (a *API) ListEvents(c *gin.Context) {
@@ -176,6 +204,13 @@ func (a *API) RevokeLotQR(c *gin.Context) {
 	}
 	if tokenErr == nil && a.QRCache != nil {
 		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(qr.PublicToken))
+	}
+	if a.KafkaPub != nil {
+		token := ""
+		if tokenErr == nil {
+			token = qr.PublicToken
+		}
+		_ = a.KafkaPub.EmitLotQRRevoked(c.Request.Context(), lotID, token)
 	}
 	c.JSON(http.StatusOK, gin.H{"lot_business_id": lotID, "revoked": true})
 }
