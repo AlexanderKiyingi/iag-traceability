@@ -11,7 +11,7 @@ func TestMapEvent_supplyChainTypes(t *testing.T) {
 		"batch_business_ids": []any{"BAT-1", "BAT-2"},
 	}
 	cases := []struct {
-		eventType                          string
+		eventType                            string
 		wantMapped, wantEntity, wantEntityID string
 	}{
 		{"scm.batch.stage_changed", "STAGE_CHANGED", "batch", "BAT-1"},
@@ -34,5 +34,19 @@ func TestMapEvent_supplyChainTypes(t *testing.T) {
 		if mapped != tc.wantMapped || entity != tc.wantEntity || id != tc.wantEntityID {
 			t.Fatalf("%s: got (%q,%q,%q) want (%q,%q,%q)", tc.eventType, mapped, entity, id, tc.wantMapped, tc.wantEntity, tc.wantEntityID)
 		}
+	}
+}
+
+func TestMapEvent_CoAFallsBackToBatch(t *testing.T) {
+	// QC may emit the CoA keyed by batch (no lot_business_id). It must map to the
+	// batch entity, not resolve to an empty ID and get dropped.
+	mapped, entity, id := mapEvent("qc.coa.issued", map[string]any{"batch_business_id": "BAT-9"})
+	if mapped != "COA_ISSUED" || entity != "batch" || id != "BAT-9" {
+		t.Fatalf("got (%q,%q,%q) want (COA_ISSUED,batch,BAT-9)", mapped, entity, id)
+	}
+	// Lot key still wins when present.
+	mapped, entity, id = mapEvent("qc.coa.issued", map[string]any{"lot_business_id": "LOT-9", "batch_business_id": "BAT-9"})
+	if mapped != "COA_ISSUED" || entity != "lot" || id != "LOT-9" {
+		t.Fatalf("got (%q,%q,%q) want (COA_ISSUED,lot,LOT-9)", mapped, entity, id)
 	}
 }

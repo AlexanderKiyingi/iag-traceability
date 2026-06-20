@@ -39,20 +39,40 @@ func PublishQR(ctx context.Context, st *store.Store, lotBusinessID, baseURL stri
 	if err := st.UpsertLotQR(ctx, lotBusinessID, token); err != nil {
 		return "", "", err
 	}
-	_ = st.UpsertStoryProjection(ctx, lotBusinessID, map[string]any{
-		"lot_business_id": lotBusinessID,
-		"status":          "published",
-		"public_url":      publicURL,
-	})
+	// Compose and persist the FULL story (journey, farms, farmers, product), not
+	// a 3-field stub. The stored projection is the fallback served on a public
+	// scan when a live SCM rebuild fails; writing a stub here would blank the
+	// story for every visitor whenever SCM is briefly unavailable.
+	composed, cerr := RebuildLotProjection(ctx, st, scmFetcher, lotBusinessID, publicURL)
+	if cerr != nil {
+		composed = map[string]any{"lot_business_id": lotBusinessID}
+	}
+	composed["lot_business_id"] = lotBusinessID
+	composed["status"] = "published"
+	composed["public_url"] = publicURL
+	_ = st.UpsertStoryProjection(ctx, lotBusinessID, composed)
 	return token, publicURL, nil
 }
 
 func ResolvePublicQR(ctx context.Context, st *store.Store, token, baseURL string) (*PublicPayload, error) {
+	return resolvePublicQR(ctx, st, token, baseURL, true)
+}
+
+// ResolvePublicQRNoCount resolves a public QR without incrementing the scan
+// counter. Used by the QR-image endpoint, which is fetched alongside (or instead
+// of) the JSON payload and would otherwise double- or over-count scans.
+func ResolvePublicQRNoCount(ctx context.Context, st *store.Store, token, baseURL string) (*PublicPayload, error) {
+	return resolvePublicQR(ctx, st, token, baseURL, false)
+}
+
+func resolvePublicQR(ctx context.Context, st *store.Store, token, baseURL string, countScan bool) (*PublicPayload, error) {
 	qr, err := st.GetLotQRByToken(ctx, token)
 	if err != nil {
 		return nil, err
 	}
-	_ = st.IncrementScanCount(ctx, token)
+	if countScan {
+		_ = st.IncrementScanCount(ctx, token)
+	}
 
 	publicURL := baseURL + "/" + token
 	payload := &PublicPayload{

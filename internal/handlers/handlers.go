@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/alvor-technologies/iag-platform-go/apierr"
@@ -28,6 +30,56 @@ type API struct {
 	ConsumerMetrics *metrics.Counters
 }
 
+const (
+	// maxEventBodyBytes caps the POST /events request body (payload is stored as JSONB).
+	maxEventBodyBytes = 256 * 1024
+	// maxOccurredAtSkew tolerates minor clock drift when validating occurred_at.
+	maxOccurredAtSkew = 5 * time.Minute
+)
+
+// validEntityType is the allowlist of entity classes the trace store and story
+// composition understand. Mirrors the entity types the Kafka consumer maps.
+func validEntityType(t string) bool {
+	switch t {
+	case "lot", "batch", "farm", "party":
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	defaultListLimit = 200
+	// maxListLimit is capped at 499 so the +1 used for has_more detection stays
+	// within the store's hard ceiling of 500.
+	maxListLimit = 499
+)
+
+// parseLimit reads a caller-supplied limit, clamping to [1, maxListLimit] and
+// falling back to the default for missing/invalid values.
+func parseLimit(raw string) int {
+	if raw == "" {
+		return defaultListLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultListLimit
+	}
+	if n > maxListLimit {
+		return maxListLimit
+	}
+	return n
+}
+
+// trimForLimit trims an over-fetched slice (limit+1) back to limit, reporting
+// whether more rows exist beyond the returned page.
+func trimForLimit(events []store.TraceEvent, limit int) ([]store.TraceEvent, bool) {
+	if len(events) > limit {
+		return events[:limit], true
+	}
+	return events, false
+}
+
 func (a *API) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",
@@ -46,18 +98,29 @@ func (a *API) Ready(c *gin.Context) {
 
 func (a *API) GetBatchChain(c *gin.Context) {
 	businessID := c.Param("businessId")
-	events, err := a.Store.ListEventsForEntity(c.Request.Context(), "batch", businessID, 200)
+	limit := parseLimit(c.Query("limit"))
+	// Fetch one extra to detect (and signal) truncation rather than silently
+	// dropping older custody events — a correctness concern for a traceability
+	// chain, which must not look complete when it isn't.
+	events, err := a.Store.ListEventsForEntity(c.Request.Context(), "batch", businessID, limit+1)
 	if err != nil {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to load chain")
 		return
 	}
+	events, hasMore := trimForLimit(events, limit)
 	c.JSON(http.StatusOK, gin.H{
 		"batch_business_id": businessID,
 		"chain":             story.BuildChainFromEvents(events),
+		"has_more":          hasMore,
+		"limit":             limit,
 	})
 }
 
 func (a *API) RecordEvent(c *gin.Context) {
+	// Cap the request body: payload/related_ids are stored verbatim as JSONB, so
+	// an unbounded body is a memory- and storage-exhaustion vector even for an
+	// authenticated caller.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxEventBodyBytes)
 	var body struct {
 		OccurredAt       *time.Time     `json:"occurred_at"`
 		EventType        string         `json:"event_type"`
@@ -69,7 +132,7 @@ func (a *API) RecordEvent(c *gin.Context) {
 		IdempotencyKey   *string        `json:"idempotency_key"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		apierr.BadRequest(c, "invalid JSON body")
+		apierr.BadRequest(c, "invalid or oversized JSON body")
 		return
 	}
 	if body.EventType == "" || body.EntityType == "" || body.EntityBusinessID == "" {
@@ -78,6 +141,10 @@ func (a *API) RecordEvent(c *gin.Context) {
 	}
 	if err := story.ValidateEventType(body.EventType); err != nil {
 		apierr.BadRequest(c, err.Error())
+		return
+	}
+	if !validEntityType(body.EntityType) {
+		apierr.BadRequest(c, "entity_type must be one of: lot, batch, farm, party")
 		return
 	}
 	if body.EventType == "CORRECTION" {
@@ -99,6 +166,13 @@ func (a *API) RecordEvent(c *gin.Context) {
 	occurred := time.Now().UTC()
 	if body.OccurredAt != nil {
 		occurred = body.OccurredAt.UTC()
+		// Custody is an append-only ledger: back-dating a historical event is
+		// legitimate, but a far-future timestamp is not — reject it to keep the
+		// chain's ordering trustworthy (small skew tolerated for clock drift).
+		if occurred.After(time.Now().UTC().Add(maxOccurredAtSkew)) {
+			apierr.BadRequest(c, "occurred_at may not be in the future")
+			return
+		}
 	}
 	var actorID *uuid.UUID
 	if uid, ok := middleware.UserID(c); ok {
@@ -144,7 +218,13 @@ func (a *API) maybeRebuildLotStory(ctx context.Context, eventType, entityType, e
 		return
 	}
 	if ok, err := story.RebuildStoredLot(ctx, a.Store, lotID, ""); err == nil && ok && a.KafkaPub != nil {
-		_ = a.KafkaPub.EmitLotStoryUpdated(ctx, lotID)
+		if emitErr := a.KafkaPub.EmitLotStoryUpdated(ctx, lotID); emitErr != nil {
+			// Best-effort, but log so a lost story_updated (and the resulting
+			// stale downstream cache) is diagnosable rather than invisible.
+			// NOTE: this is a fire-and-forget dual-write; a transactional outbox
+			// is the durable fix (tracked as a follow-up).
+			log.Printf("traceability: emit story_updated lot=%s: %v", lotID, emitErr)
+		}
 	}
 }
 
@@ -155,12 +235,18 @@ func (a *API) ListEvents(c *gin.Context) {
 		apierr.BadRequest(c, "entity_type and entity_business_id query params are required")
 		return
 	}
-	events, err := a.Store.ListEventsForEntity(c.Request.Context(), entityType, businessID, 200)
+	if !validEntityType(entityType) {
+		apierr.BadRequest(c, "entity_type must be one of: lot, batch, farm, party")
+		return
+	}
+	limit := parseLimit(c.Query("limit"))
+	events, err := a.Store.ListEventsForEntity(c.Request.Context(), entityType, businessID, limit+1)
 	if err != nil {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to list events")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"events": events})
+	events, hasMore := trimForLimit(events, limit)
+	c.JSON(http.StatusOK, gin.H{"events": events, "has_more": hasMore, "limit": limit})
 }
 
 func (a *API) PublishLotQR(c *gin.Context) {
@@ -179,7 +265,9 @@ func (a *API) PublishLotQR(c *gin.Context) {
 		return
 	}
 	if a.KafkaPub != nil {
-		_ = a.KafkaPub.EmitLotQRPublished(c.Request.Context(), lotID, token, publicURL)
+		if emitErr := a.KafkaPub.EmitLotQRPublished(c.Request.Context(), lotID, token, publicURL); emitErr != nil {
+			log.Printf("traceability: emit qr_published lot=%s: %v", lotID, emitErr)
+		}
 	}
 	if a.QRCache != nil {
 		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(token))
@@ -210,7 +298,9 @@ func (a *API) RevokeLotQR(c *gin.Context) {
 		if tokenErr == nil {
 			token = qr.PublicToken
 		}
-		_ = a.KafkaPub.EmitLotQRRevoked(c.Request.Context(), lotID, token)
+		if emitErr := a.KafkaPub.EmitLotQRRevoked(c.Request.Context(), lotID, token); emitErr != nil {
+			log.Printf("traceability: emit qr_revoked lot=%s: %v", lotID, emitErr)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"lot_business_id": lotID, "revoked": true})
 }
@@ -254,7 +344,9 @@ func publicQRCacheKey(token string) string {
 
 func (a *API) PublicQRPng(c *gin.Context) {
 	token := c.Param("token")
-	payload, err := story.ResolvePublicQR(c.Request.Context(), a.Store, token, a.Cfg.PublicTraceBaseURL)
+	// No-count: the image is an asset of the same logical scan as the JSON
+	// payload; counting it would inflate scan_count (and the admin metric).
+	payload, err := story.ResolvePublicQRNoCount(c.Request.Context(), a.Store, token, a.Cfg.PublicTraceBaseURL)
 	if err != nil {
 		if err == store.ErrNotFound {
 			apierr.NotFound(c, "QR not found or revoked")

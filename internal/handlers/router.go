@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -13,17 +14,27 @@ import (
 )
 
 type RouterDeps struct {
-	API               *API
-	Audit             *auditlog.Store
-	PlatformAuth      *appmw.PlatformAuth
-	CORSOrigins       []string
-	PublicRatePerMin  float64
-	PublicRateBurst   int
+	API              *API
+	Audit            *auditlog.Store
+	PlatformAuth     *appmw.PlatformAuth
+	CORSOrigins      []string
+	PublicRatePerMin float64
+	PublicRateBurst  int
+	TrustedProxies   []string
 }
 
 func NewRouter(deps RouterDeps) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// Control which upstream proxies may set X-Forwarded-For for ClientIP
+	// derivation. Default (empty list) trusts none, so the public rate limiter
+	// keys on the real peer and cannot be bypassed via a forged header. Operators
+	// behind the gateway set TRUSTED_PROXIES to the gateway address for per-user
+	// limiting. SetTrustedProxies only errors on malformed CIDRs.
+	if err := r.SetTrustedProxies(deps.TrustedProxies); err != nil {
+		log.Printf("traceability: invalid TRUSTED_PROXIES (%v) — trusting no proxies", err)
+		_ = r.SetTrustedProxies(nil)
+	}
 	// otelgin first so the server span wraps the whole request.
 	r.Use(otelgin.Middleware("iag-traceability"))
 	r.Use(gin.Recovery())

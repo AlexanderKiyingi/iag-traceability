@@ -59,8 +59,9 @@ func PublicRateLimit(perMinute float64, burst int) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := c.ClientIP()
 		if key == "" {
-			c.Next()
-			return
+			// Fail closed, not open: an unidentifiable client shares a single
+			// fallback bucket rather than bypassing the limiter entirely.
+			key = "_unknown"
 		}
 		if !lm.get(key).Allow() {
 			c.Header("Retry-After", "60")

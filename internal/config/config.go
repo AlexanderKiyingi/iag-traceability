@@ -21,19 +21,19 @@ type Config struct {
 	RedisURL    string
 	AutoMigrate bool
 
-	AuthMode              string
-	JWTIssuer             string
-	JWKSURL               string
-	Audience              string
-	ServiceClientID       string
-	ServiceClientSecret   string
-	AuthTokenURL          string
-	CORSOrigins           []string
-	GatewayAPIPrefix      string
-	PublicTraceBaseURL    string
-	PublicAPIURL          string
-	SupplyChainBaseURL    string
-	SupplyChainAudience   string
+	AuthMode            string
+	JWTIssuer           string
+	JWKSURL             string
+	Audience            string
+	ServiceClientID     string
+	ServiceClientSecret string
+	AuthTokenURL        string
+	CORSOrigins         []string
+	GatewayAPIPrefix    string
+	PublicTraceBaseURL  string
+	PublicAPIURL        string
+	SupplyChainBaseURL  string
+	SupplyChainAudience string
 
 	KafkaBrokers          []string
 	KafkaClientID         string
@@ -42,10 +42,21 @@ type Config struct {
 	KafkaProductionTopic  string
 	KafkaQualityTopic     string
 
-	PublicRateLimitPerMin float64
-	PublicRateBurst       int
-	CacheTTL              time.Duration
+	PublicRateLimitPerMin   float64
+	PublicRateBurst         int
+	CacheTTL                time.Duration
 	StoryPlaceholderJourney bool
+
+	// TrustedProxies is the CIDR/IP allowlist Gin uses to honor X-Forwarded-For
+	// when deriving the client IP for rate limiting. Empty (the default) means
+	// trust NO proxy headers — ClientIP is the direct peer, so the per-IP rate
+	// limiter cannot be defeated by a forged X-Forwarded-For. Set this to the
+	// gateway's address(es) in production to restore true per-end-user limiting.
+	TrustedProxies []string
+	// PublicPreciseGeo controls whether the unauthenticated public QR payload
+	// exposes precise farm/farmer GPS coordinates. Default false: coordinates are
+	// coarsened (~1km) to protect smallholder location privacy.
+	PublicPreciseGeo bool
 }
 
 func Load() (*Config, error) {
@@ -60,36 +71,38 @@ func Load() (*Config, error) {
 	}
 
 	c := &Config{
-		Environment:           env,
-		ServiceName:           getenv("SERVICE_NAME", "traceability"),
-		Port:                  getenv("PORT", "4011"),
-		LogLevel:              getenv("LOG_LEVEL", "info"),
-		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		RedisURL:              getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
-		AutoMigrate:           getenv("AUTO_MIGRATE", "true") != "false",
-		AuthMode:              authMode,
-		JWTIssuer:             getenv("JWT_ISSUER", "http://localhost:3001"),
-		JWKSURL:               getenv("JWKS_URL", "http://localhost:3001/.well-known/jwks.json"),
-		Audience:              getenv("AUDIENCE", "iag.traceability"),
-		ServiceClientID:       getenv("SERVICE_CLIENT_ID", "iag-traceability"),
-		ServiceClientSecret:   os.Getenv("SERVICE_CLIENT_SECRET"),
-		AuthTokenURL:          strings.TrimSpace(getenv("AUTH_TOKEN_URL", "")),
-		CORSOrigins:           splitCSV(corsenv.Allowlist("http://localhost:3000,http://localhost:8080")),
-		GatewayAPIPrefix:      getenv("GATEWAY_API_PREFIX", "/api/v1/traceability"),
-		PublicTraceBaseURL:    getenv("PUBLIC_TRACE_BASE_URL", "http://localhost:8080/api/v1/traceability/public/q"),
-		PublicAPIURL:          getenv("PUBLIC_API_URL", "http://localhost:8080"),
-		SupplyChainBaseURL:    strings.TrimRight(getenv("SUPPLY_CHAIN_BASE_URL", "http://127.0.0.1:4007"), "/"),
-		SupplyChainAudience:   getenv("SUPPLY_CHAIN_AUDIENCE", "iag.supply-chain"),
-		KafkaBrokers:          splitCSV(getenv("KAFKA_BROKERS", "")),
-		KafkaClientID:         getenv("KAFKA_CLIENT_ID", "iag-traceability"),
-		KafkaConsumerGroup:    getenv("KAFKA_CONSUMER_GROUP", "iag.traceability"),
-		KafkaSupplyChainTopic: getenv("KAFKA_SUPPLY_CHAIN_TOPIC", "iag.supply-chain"),
-		KafkaProductionTopic:  getenv("KAFKA_PRODUCTION_TOPIC", "iag.production"),
-		KafkaQualityTopic:     getenv("KAFKA_QUALITY_TOPIC", "iag.quality"),
-		PublicRateLimitPerMin: getEnvFloat("PUBLIC_RATE_LIMIT", 60),
-		PublicRateBurst:       getEnvInt("PUBLIC_RATE_BURST", 10),
-		CacheTTL:              getEnvDuration("CACHE_TTL", "5m"),
+		Environment:             env,
+		ServiceName:             getenv("SERVICE_NAME", "traceability"),
+		Port:                    getenv("PORT", "4011"),
+		LogLevel:                getenv("LOG_LEVEL", "info"),
+		DatabaseURL:             strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		RedisURL:                getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+		AutoMigrate:             getenv("AUTO_MIGRATE", "true") != "false",
+		AuthMode:                authMode,
+		JWTIssuer:               getenv("JWT_ISSUER", "http://localhost:3001"),
+		JWKSURL:                 getenv("JWKS_URL", "http://localhost:3001/.well-known/jwks.json"),
+		Audience:                getenv("AUDIENCE", "iag.traceability"),
+		ServiceClientID:         getenv("SERVICE_CLIENT_ID", "iag-traceability"),
+		ServiceClientSecret:     os.Getenv("SERVICE_CLIENT_SECRET"),
+		AuthTokenURL:            strings.TrimSpace(getenv("AUTH_TOKEN_URL", "")),
+		CORSOrigins:             splitCSV(corsenv.Allowlist("http://localhost:3000,http://localhost:8080")),
+		GatewayAPIPrefix:        getenv("GATEWAY_API_PREFIX", "/api/v1/traceability"),
+		PublicTraceBaseURL:      getenv("PUBLIC_TRACE_BASE_URL", "http://localhost:8080/api/v1/traceability/public/q"),
+		PublicAPIURL:            getenv("PUBLIC_API_URL", "http://localhost:8080"),
+		SupplyChainBaseURL:      strings.TrimRight(getenv("SUPPLY_CHAIN_BASE_URL", "http://127.0.0.1:4007"), "/"),
+		SupplyChainAudience:     getenv("SUPPLY_CHAIN_AUDIENCE", "iag.supply-chain"),
+		KafkaBrokers:            splitCSV(getenv("KAFKA_BROKERS", "")),
+		KafkaClientID:           getenv("KAFKA_CLIENT_ID", "iag-traceability"),
+		KafkaConsumerGroup:      getenv("KAFKA_CONSUMER_GROUP", "iag.traceability"),
+		KafkaSupplyChainTopic:   getenv("KAFKA_SUPPLY_CHAIN_TOPIC", "iag.supply-chain"),
+		KafkaProductionTopic:    getenv("KAFKA_PRODUCTION_TOPIC", "iag.production"),
+		KafkaQualityTopic:       getenv("KAFKA_QUALITY_TOPIC", "iag.quality"),
+		PublicRateLimitPerMin:   getEnvFloat("PUBLIC_RATE_LIMIT", 60),
+		PublicRateBurst:         getEnvInt("PUBLIC_RATE_BURST", 10),
+		CacheTTL:                getEnvDuration("CACHE_TTL", "5m"),
 		StoryPlaceholderJourney: getEnvBool("STORY_PLACEHOLDER_JOURNEY", env != "production"),
+		TrustedProxies:          splitCSV(getenv("TRUSTED_PROXIES", "")),
+		PublicPreciseGeo:        getEnvBool("PUBLIC_PRECISE_GEO", false),
 	}
 
 	if c.DatabaseURL == "" {

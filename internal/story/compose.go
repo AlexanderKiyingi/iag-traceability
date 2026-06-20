@@ -3,6 +3,7 @@ package story
 import (
 	"context"
 	"sort"
+	"strings"
 
 	"iag-traceability/backend/internal/scmclient"
 	"iag-traceability/backend/internal/store"
@@ -57,6 +58,10 @@ func RebuildLotProjection(ctx context.Context, st *store.Store, scm *scmclient.C
 
 	if scm != nil && scm.Enabled() {
 		if preview, err := scm.GetQRPreview(ctx, lotBusinessID); err == nil && preview != nil {
+			// The SCM preview is raw upstream JSON returned verbatim — it bypasses
+			// the per-entity enrichment below, so apply the same redaction to any
+			// farmers/farms it carries before serving it to anonymous consumers.
+			sanitizePreviewEntities(preview)
 			return preview, nil
 		}
 		if lot, err := scm.GetExportLot(ctx, lotBusinessID); err == nil {
@@ -145,6 +150,7 @@ func enrichFarmsFromProjections(ctx context.Context, st *store.Store, story map[
 			for k, v := range proj {
 				entry[k] = v
 			}
+			redactPublicEntity(entry)
 			farms = append(farms, entry)
 		}
 	}
@@ -178,17 +184,10 @@ func enrichFarmersFromProjections(ctx context.Context, st *store.Store, story ma
 				entry[k] = v
 			}
 		}
-		if name, ok := strMapField(entry, "name"); ok {
-			entry["name"] = name
-		}
-		if loc, ok := entry["location"].(map[string]any); ok {
-			if district, ok := strMapField(loc, "district"); ok {
-				entry["district"] = district
-			}
-			if lat, lng, ok := coordsFromMap(loc); ok {
-				entry["map"] = map[string]any{"lat": lat, "lng": lng}
-			}
-		}
+		// The party projection is the raw SCM event payload, which may carry PII
+		// (phone, email, national ID, exact GPS) never meant for the anonymous
+		// public story. Redact it down to safe, coarsened fields.
+		redactPublicEntity(entry)
 		farmers = append(farmers, entry)
 	}
 	if len(farmers) > 0 {
@@ -243,6 +242,99 @@ func numField(data map[string]any, key string) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// sensitivePublicKeys are projection field names that must never appear in the
+// anonymous public QR payload. Matched case-insensitively against each key. The
+// party/farm projection is the raw SCM event, so it may carry any of these.
+var sensitivePublicKeys = map[string]bool{
+	"phone": true, "phone_number": true, "telephone": true, "mobile": true,
+	"msisdn": true, "contact": true, "contact_number": true,
+	"email": true, "email_address": true,
+	"national_id": true, "nin": true, "id_number": true, "id_no": true,
+	"passport": true, "passport_number": true, "tin": true,
+	"address": true, "physical_address": true, "residential_address": true,
+	"next_of_kin": true, "kin": true,
+	"dob": true, "date_of_birth": true, "birth_date": true, "gender": true,
+	"bank": true, "bank_account": true, "account_number": true,
+	"gps": true, "geo": true, "coordinates": true, "coords": true,
+	"latitude": true, "longitude": true, "lat": true, "lng": true, "location": true,
+}
+
+// redactPublicEntity makes a farmer/farm projection entry safe for the anonymous
+// public payload: it coarsens geo (preserving district + a ~1km map point) and
+// removes any known PII / precise-location keys. Applied uniformly to every
+// entity that reaches the public story.
+func redactPublicEntity(entry map[string]any) {
+	// Derive the coarsened map + district first (reads location/lat/lng), then
+	// the denylist sweep below removes the raw precise fields.
+	sanitizePublicGeo(entry)
+	for k := range entry {
+		if sensitivePublicKeys[strings.ToLower(k)] {
+			delete(entry, k)
+		}
+	}
+}
+
+// sanitizePreviewEntities redacts the farmers/farms arrays of an SCM preview,
+// which is otherwise returned verbatim and bypasses per-entity enrichment.
+func sanitizePreviewEntities(preview map[string]any) {
+	for _, key := range []string{"farmers", "farms"} {
+		switch arr := preview[key].(type) {
+		case []map[string]any:
+			for _, e := range arr {
+				redactPublicEntity(e)
+			}
+		case []any:
+			for _, e := range arr {
+				if m, ok := e.(map[string]any); ok {
+					redactPublicEntity(m)
+				}
+			}
+		}
+	}
+}
+
+// sanitizePublicGeo coarsens or strips precise location data from a public
+// projection entry: it replaces a nested "location" map's coordinates with a
+// coarsened {lat,lng} "map" (district preserved) and drops the raw location and
+// any top-level lat/lng so anonymous consumers never see exact GPS.
+func sanitizePublicGeo(entry map[string]any) {
+	if loc, ok := entry["location"].(map[string]any); ok {
+		if district, ok := strMapField(loc, "district"); ok {
+			entry["district"] = district
+		}
+		if lat, lng, ok := coordsFromMap(loc); ok {
+			lat, lng = publicCoords(lat, lng)
+			entry["map"] = map[string]any{"lat": lat, "lng": lng}
+		}
+		delete(entry, "location")
+	}
+	if lat, latOK := numField(entry, "lat"); latOK {
+		if lng, lngOK := numField(entry, "lng"); lngOK {
+			lat, lng = publicCoords(lat, lng)
+			entry["map"] = map[string]any{"lat": lat, "lng": lng}
+		}
+		delete(entry, "lat")
+		delete(entry, "lng")
+	}
+}
+
+// publicCoords coarsens coordinates for the anonymous public payload. Unless
+// PreciseGeo is enabled, lat/lng are rounded to 2 decimal places (~1.1km) so a
+// scanned QR reveals the growing area without pinpointing a farmer's home.
+func publicCoords(lat, lng float64) (float64, float64) {
+	if opts.PreciseGeo {
+		return lat, lng
+	}
+	round2 := func(v float64) float64 {
+		// Round half away from zero at 2dp without importing math.
+		if v >= 0 {
+			return float64(int64(v*100+0.5)) / 100
+		}
+		return float64(int64(v*100-0.5)) / 100
+	}
+	return round2(lat), round2(lng)
 }
 
 func coordsFromMap(loc map[string]any) (lat, lng float64, ok bool) {

@@ -2,6 +2,7 @@ package story
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"iag-traceability/backend/internal/store"
@@ -32,9 +33,17 @@ func isSCMTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A context deadline/cancellation is a transport problem (slow/unreachable
+	// SCM), not a compliance verdict. errors.Is catches the wrapped sentinels
+	// reliably, where substring matching on "timeout" would miss
+	// "context deadline exceeded" and wrongly report COMPLIANCE_FAILED.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "no such host") ||
 		strings.Contains(msg, "scm 5") ||
 		strings.Contains(msg, "scm 502") ||

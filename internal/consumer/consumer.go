@@ -182,7 +182,7 @@ func (c *Consumer) maybeRebuildLotsForBatch(ctx context.Context, batchID string,
 	switch mappedType {
 	case "WET_MILL_STARTED", "WET_MILL_COMPLETE", "DRYING_STARTED", "DRYING_COMPLETE",
 		"DRY_MILL_COMPLETE", "SAMPLE_SUBMITTED", "LAB_RESULT_RECORDED", "CHERRY_RECEIVED",
-		"STAGE_CHANGED":
+		"STAGE_CHANGED", "COA_ISSUED":
 	default:
 		return
 	}
@@ -283,8 +283,15 @@ func mapEvent(eventType string, data map[string]any) (mappedType, entityType, en
 		bid, _ := strField(data, "batch_business_id")
 		return "SAMPLE_SUBMITTED", "batch", bid
 	case "qc.coa.issued":
-		lid, _ := strField(data, "lot_business_id")
-		return "COA_ISSUED", "lot", lid
+		// CoA is conceptually a lot-level certificate, but QC may emit it keyed
+		// by batch (every other qc.*/mes.* event carries batch_business_id). Fall
+		// back to the batch entity so the event is recorded and triggers a story
+		// rebuild instead of resolving to an empty entity ID and being dropped.
+		if lid, ok := strField(data, "lot_business_id"); ok {
+			return "COA_ISSUED", "lot", lid
+		}
+		bid, _ := strField(data, "batch_business_id")
+		return "COA_ISSUED", "batch", bid
 	default:
 		return "", "", ""
 	}
