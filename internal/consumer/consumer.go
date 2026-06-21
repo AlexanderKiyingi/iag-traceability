@@ -255,6 +255,11 @@ func mapEvent(eventType string, data map[string]any) (mappedType, entityType, en
 	case "scm.party.updated":
 		pid, _ := strField(data, "party_business_id")
 		return "PARTY_UPDATED", "party", pid
+	case "scm.party.member_changed":
+		// Cooperative membership add/remove. Recorded against the member farmer's
+		// party entity; carries the cooperative + action in the payload.
+		pid, _ := strField(data, "member_business_id")
+		return "MEMBER_CHANGED", "party", pid
 	case "scm.farm.updated":
 		fid, _ := strField(data, "farm_business_id")
 		return "FARM_UPDATED", "farm", fid

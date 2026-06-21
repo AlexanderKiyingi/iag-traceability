@@ -37,6 +37,17 @@ func TestMapEvent_supplyChainTypes(t *testing.T) {
 	}
 }
 
+func TestMapEvent_CooperativeMemberChanged(t *testing.T) {
+	mapped, entity, id := mapEvent("scm.party.member_changed", map[string]any{
+		"cooperative_business_id": "COOP-001",
+		"member_business_id":      "FRM-007",
+		"action":                  "added",
+	})
+	if mapped != "MEMBER_CHANGED" || entity != "party" || id != "FRM-007" {
+		t.Fatalf("got (%q,%q,%q) want (MEMBER_CHANGED,party,FRM-007)", mapped, entity, id)
+	}
+}
+
 func TestMapEvent_CoAFallsBackToBatch(t *testing.T) {
 	// QC may emit the CoA keyed by batch (no lot_business_id). It must map to the
 	// batch entity, not resolve to an empty ID and get dropped.

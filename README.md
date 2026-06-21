@@ -23,6 +23,8 @@ Central **traceability hub** for IAG Coffee:
 
 Plan: [TRACEABILITY_AND_SUPPLIER_PLATFORM.md](../../../docs/planning/TRACEABILITY_AND_SUPPLIER_PLATFORM.md)
 
+**Next.js frontend:** custody/QR/public routes are documented in the SCM guide — [FRONTEND_INTEGRATION.md](../../IAG_SCM_backend/docs/FRONTEND_INTEGRATION.md) (§7 Traceability).
+
 ## Quick start (monorepo)
 
 ```bash
