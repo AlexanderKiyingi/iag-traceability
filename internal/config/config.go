@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -28,6 +29,9 @@ type Config struct {
 	ServiceClientID     string
 	ServiceClientSecret string
 	AuthTokenURL        string
+	// AuthServiceURL is the auth HTTP root for outbound calls (permissions register).
+	// In Docker this differs from JWT_ISSUER when tokens use iss=localhost.
+	AuthServiceURL      string
 	CORSOrigins         []string
 	GatewayAPIPrefix    string
 	PublicTraceBaseURL  string
@@ -111,7 +115,31 @@ func Load() (*Config, error) {
 	if c.AuthTokenURL == "" {
 		c.AuthTokenURL = strings.TrimRight(c.JWTIssuer, "/") + "/oauth/token"
 	}
+	c.AuthServiceURL = strings.TrimSpace(os.Getenv("AUTH_SERVICE_URL"))
+	if c.AuthServiceURL == "" {
+		c.AuthServiceURL = authServiceBaseFromTokenURL(c.AuthTokenURL)
+	}
+	if c.AuthServiceURL == "" {
+		c.AuthServiceURL = strings.TrimRight(c.JWTIssuer, "/")
+	}
 	return c, nil
+}
+
+func authServiceBaseFromTokenURL(tokenURL string) string {
+	tokenURL = strings.TrimSpace(tokenURL)
+	if tokenURL == "" {
+		return ""
+	}
+	if u, err := url.Parse(tokenURL); err == nil && u.Scheme != "" && u.Host != "" {
+		u.Path = ""
+		u.RawQuery = ""
+		u.Fragment = ""
+		return strings.TrimRight(u.String(), "/")
+	}
+	if i := strings.LastIndex(tokenURL, "/oauth/token"); i > 0 {
+		return strings.TrimRight(tokenURL[:i], "/")
+	}
+	return strings.TrimRight(tokenURL, "/")
 }
 
 func getenv(key, def string) string {

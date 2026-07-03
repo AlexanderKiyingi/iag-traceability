@@ -26,7 +26,7 @@ func registerPermissionsLoop(ctx context.Context, cfg *config.Config) {
 	backoff := time.Second
 	for {
 		regCtx, c := context.WithTimeout(ctx, 10*time.Second)
-		err := platformserviceauth.RegisterPermissions(regCtx, saClient, cfg.JWTIssuer, "traceability", perms)
+		err := platformserviceauth.RegisterPermissions(regCtx, saClient, cfg.AuthServiceURL, "traceability", perms)
 		c()
 		if err == nil {
 			log.Printf("traceability: registered %d permissions", len(perms))
