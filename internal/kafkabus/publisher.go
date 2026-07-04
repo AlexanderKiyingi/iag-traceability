@@ -2,8 +2,11 @@ package kafkabus
 
 import (
 	"context"
+	"encoding/json"
 
 	platformevents "github.com/alvor-technologies/iag-platform-go/events"
+
+	"iag-traceability/backend/internal/store"
 )
 
 const (
@@ -11,7 +14,11 @@ const (
 	Source = "iag.traceability"
 )
 
-// Publisher emits selected domain events from iag-traceability.
+// Publisher sends domain-event envelopes to Kafka. Emission is now routed
+// through the transactional outbox (see store.OutboxRow + Relay): callers
+// enqueue an OutboxRow atomically with their state change, and the Relay uses
+// this Publisher to deliver rows to the bus with retries. This decouples event
+// durability from broker availability at request time.
 type Publisher struct {
 	producer *platformevents.Producer
 }
@@ -30,41 +37,61 @@ func NewPublisher(brokers []string, clientID string) *Publisher {
 
 func (p *Publisher) Enabled() bool { return p != nil && p.producer != nil }
 
-func (p *Publisher) EmitLotQRPublished(ctx context.Context, lotBusinessID, token, publicURL string) error {
+// PublishEnvelope delivers a pre-built envelope to the bus. Used by the Relay
+// to drain the outbox. A no-op (nil) when Kafka is not configured.
+func (p *Publisher) PublishEnvelope(ctx context.Context, topic, key string, env platformevents.Envelope) error {
 	if !p.Enabled() {
 		return nil
 	}
-	env := platformevents.NewEnvelope(Source, "scm.lot.qr_published", map[string]any{
+	return p.producer.Publish(ctx, topic, key, env)
+}
+
+// ---- Outbox row builders -------------------------------------------------
+// Each builds the CloudEvents envelope and serializes it into an OutboxRow so
+// the event id (used for downstream dedupe) is fixed at enqueue time and
+// preserved across relay retries.
+
+func outboxRow(env platformevents.Envelope, key string) store.OutboxRow {
+	payload, _ := json.Marshal(env)
+	return store.OutboxRow{
+		EventID: env.ID,
+		Topic:   Topic,
+		Key:     key,
+		Subject: env.Type,
+		Payload: payload,
+	}
+}
+
+func LotQRPublishedRow(lotBusinessID, token, publicURL string) store.OutboxRow {
+	return outboxRow(platformevents.NewEnvelope(Source, "scm.lot.qr_published", map[string]any{
 		"lot_business_id": lotBusinessID,
 		"public_token":    token,
 		"public_url":      publicURL,
-	})
-	return p.producer.Publish(ctx, Topic, lotBusinessID, env)
+	}), lotBusinessID)
 }
 
-// EmitLotStoryUpdated announces that a lot's composed story projection was
-// rebuilt, so downstream caches/CDNs can invalidate on content change (not just
-// on publish/revoke).
-func (p *Publisher) EmitLotStoryUpdated(ctx context.Context, lotBusinessID string) error {
-	if !p.Enabled() {
-		return nil
-	}
-	env := platformevents.NewEnvelope(Source, "scm.lot.story_updated", map[string]any{
-		"lot_business_id": lotBusinessID,
-	})
-	return p.producer.Publish(ctx, Topic, lotBusinessID, env)
-}
-
-// EmitLotQRRevoked announces that a previously published QR has been revoked,
-// so downstream consumers (and any caches/CDNs keyed off the event stream)
-// can react. Previously revoke was silent on the bus.
-func (p *Publisher) EmitLotQRRevoked(ctx context.Context, lotBusinessID, token string) error {
-	if !p.Enabled() {
-		return nil
-	}
-	env := platformevents.NewEnvelope(Source, "scm.lot.qr_revoked", map[string]any{
+func LotQRRevokedRow(lotBusinessID, token string) store.OutboxRow {
+	return outboxRow(platformevents.NewEnvelope(Source, "scm.lot.qr_revoked", map[string]any{
 		"lot_business_id": lotBusinessID,
 		"public_token":    token,
-	})
-	return p.producer.Publish(ctx, Topic, lotBusinessID, env)
+	}), lotBusinessID)
+}
+
+func LotStoryUpdatedRow(lotBusinessID string) store.OutboxRow {
+	return outboxRow(platformevents.NewEnvelope(Source, "scm.lot.story_updated", map[string]any{
+		"lot_business_id": lotBusinessID,
+	}), lotBusinessID)
+}
+
+// OutboxEmitter enqueues story-updated events to the transactional outbox,
+// satisfying consumer.StoryPublisher so the Kafka consumer's projections emit
+// durably rather than via a fire-and-forget dual-write.
+type OutboxEmitter struct {
+	st *store.Store
+}
+
+func NewOutboxEmitter(st *store.Store) *OutboxEmitter { return &OutboxEmitter{st: st} }
+
+func (e *OutboxEmitter) EmitLotStoryUpdated(ctx context.Context, lotBusinessID string) error {
+	return e.st.EnqueueOutbox(ctx, LotStoryUpdatedRow(lotBusinessID))
 }

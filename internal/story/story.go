@@ -33,16 +33,17 @@ func randomToken() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-func PublishQR(ctx context.Context, st *store.Store, lotBusinessID, baseURL string) (token, publicURL string, err error) {
-	token = randomToken()
-	publicURL = baseURL + "/" + token
-	if err := st.UpsertLotQR(ctx, lotBusinessID, token); err != nil {
-		return "", "", err
-	}
-	// Compose and persist the FULL story (journey, farms, farmers, product), not
-	// a 3-field stub. The stored projection is the fallback served on a public
-	// scan when a live SCM rebuild fails; writing a stub here would blank the
-	// story for every visitor whenever SCM is briefly unavailable.
+// GeneratePublicToken mints a fresh, unguessable public QR token. The caller
+// persists it (atomically with the qr_published outbox event) via the store.
+func GeneratePublicToken() string { return randomToken() }
+
+// ComposeAndStoreLotStory composes and persists the FULL public story (journey,
+// farms, farmers, product) for a just-published lot. This runs OUTSIDE the QR
+// upsert transaction because it may call SCM over the network; it is
+// best-effort — the stored projection is only the fallback served on a public
+// scan when a live rebuild fails, so a transient failure here does not blank
+// the story (a later scan or story_updated rebuild refreshes it).
+func ComposeAndStoreLotStory(ctx context.Context, st *store.Store, lotBusinessID, publicURL string) error {
 	composed, cerr := RebuildLotProjection(ctx, st, scmFetcher, lotBusinessID, publicURL)
 	if cerr != nil {
 		composed = map[string]any{"lot_business_id": lotBusinessID}
@@ -50,8 +51,7 @@ func PublishQR(ctx context.Context, st *store.Store, lotBusinessID, baseURL stri
 	composed["lot_business_id"] = lotBusinessID
 	composed["status"] = "published"
 	composed["public_url"] = publicURL
-	_ = st.UpsertStoryProjection(ctx, lotBusinessID, composed)
-	return token, publicURL, nil
+	return st.UpsertStoryProjection(ctx, lotBusinessID, composed)
 }
 
 func ResolvePublicQR(ctx context.Context, st *store.Store, token, baseURL string) (*PublicPayload, error) {

@@ -127,12 +127,18 @@ func main() {
 			SupplyChainTopic: cfg.KafkaSupplyChainTopic,
 			ProductionTopic:  cfg.KafkaProductionTopic,
 			QualityTopic:     cfg.KafkaQualityTopic,
-		}, st, scm, consumerMetrics, kafkaPub)
+			// Story-updated events from projections are enqueued to the
+			// transactional outbox and delivered by the relay below.
+		}, st, scm, consumerMetrics, kafkabus.NewOutboxEmitter(st))
 		go func() {
 			if err := kc.Run(ctx); err != nil {
 				log.Printf("kafka consumer stopped: %v", err)
 			}
 		}()
+
+		// Relay: drain the transactional outbox to Kafka. Only runs when a
+		// broker is configured; otherwise events accumulate durably until it is.
+		go kafkabus.NewRelay(st, kafkaPub).Run(ctx)
 	}
 
 	api := &handlers.API{

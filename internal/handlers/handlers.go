@@ -217,13 +217,11 @@ func (a *API) maybeRebuildLotStory(ctx context.Context, eventType, entityType, e
 	if lotID == "" {
 		return
 	}
-	if ok, err := story.RebuildStoredLot(ctx, a.Store, lotID, ""); err == nil && ok && a.KafkaPub != nil {
-		if emitErr := a.KafkaPub.EmitLotStoryUpdated(ctx, lotID); emitErr != nil {
-			// Best-effort, but log so a lost story_updated (and the resulting
-			// stale downstream cache) is diagnosable rather than invisible.
-			// NOTE: this is a fire-and-forget dual-write; a transactional outbox
-			// is the durable fix (tracked as a follow-up).
-			log.Printf("traceability: emit story_updated lot=%s: %v", lotID, emitErr)
+	if ok, err := story.RebuildStoredLot(ctx, a.Store, lotID, ""); err == nil && ok {
+		// Durable emit: enqueue the story_updated event to the transactional
+		// outbox; the relay delivers it to Kafka with retries.
+		if emitErr := a.Store.EnqueueOutbox(ctx, kafkabus.LotStoryUpdatedRow(lotID)); emitErr != nil {
+			log.Printf("traceability: enqueue story_updated lot=%s: %v", lotID, emitErr)
 		}
 	}
 }
@@ -259,15 +257,19 @@ func (a *API) PublishLotQR(c *gin.Context) {
 		apierr.Write(c, http.StatusUnprocessableEntity, "COMPLIANCE_FAILED", err.Error())
 		return
 	}
-	token, publicURL, err := story.PublishQR(c.Request.Context(), a.Store, lotID, a.Cfg.PublicTraceBaseURL)
-	if err != nil {
+	token := story.GeneratePublicToken()
+	publicURL := a.Cfg.PublicTraceBaseURL + "/" + token
+	// Persist the QR token and enqueue the qr_published event in ONE
+	// transaction (transactional outbox) so the published QR and its event
+	// commit atomically — the relay then delivers the event to Kafka durably.
+	if err := a.Store.UpsertLotQRTx(c.Request.Context(), lotID, token, kafkabus.LotQRPublishedRow(lotID, token, publicURL)); err != nil {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to publish QR")
 		return
 	}
-	if a.KafkaPub != nil {
-		if emitErr := a.KafkaPub.EmitLotQRPublished(c.Request.Context(), lotID, token, publicURL); emitErr != nil {
-			log.Printf("traceability: emit qr_published lot=%s: %v", lotID, emitErr)
-		}
+	// Compose the full public story (may call SCM over the network) outside the
+	// transaction; best-effort, refreshed later on scan / story_updated.
+	if cerr := story.ComposeAndStoreLotStory(c.Request.Context(), a.Store, lotID, publicURL); cerr != nil {
+		log.Printf("traceability: compose story lot=%s: %v", lotID, cerr)
 	}
 	if a.QRCache != nil {
 		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(token))
@@ -282,7 +284,13 @@ func (a *API) PublishLotQR(c *gin.Context) {
 func (a *API) RevokeLotQR(c *gin.Context) {
 	lotID := c.Param("businessId")
 	qr, tokenErr := a.Store.GetLotQRByLotID(c.Request.Context(), lotID)
-	if err := a.Store.RevokeLotQR(c.Request.Context(), lotID); err != nil {
+	token := ""
+	if tokenErr == nil {
+		token = qr.PublicToken
+	}
+	// Revoke and enqueue the qr_revoked event atomically; ErrNotFound rolls the
+	// transaction back so no spurious event is emitted for a missing/revoked QR.
+	if err := a.Store.RevokeLotQRTx(c.Request.Context(), lotID, kafkabus.LotQRRevokedRow(lotID, token)); err != nil {
 		if err == store.ErrNotFound {
 			apierr.NotFound(c, "lot QR not found or already revoked")
 			return
@@ -292,15 +300,6 @@ func (a *API) RevokeLotQR(c *gin.Context) {
 	}
 	if tokenErr == nil && a.QRCache != nil {
 		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(qr.PublicToken))
-	}
-	if a.KafkaPub != nil {
-		token := ""
-		if tokenErr == nil {
-			token = qr.PublicToken
-		}
-		if emitErr := a.KafkaPub.EmitLotQRRevoked(c.Request.Context(), lotID, token); emitErr != nil {
-			log.Printf("traceability: emit qr_revoked lot=%s: %v", lotID, emitErr)
-		}
 	}
 	c.JSON(http.StatusOK, gin.H{"lot_business_id": lotID, "revoked": true})
 }

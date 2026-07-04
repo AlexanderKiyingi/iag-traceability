@@ -25,18 +25,18 @@ func (s *Store) Pool() *pgxpool.Pool {
 }
 
 type TraceEvent struct {
-	ID               uuid.UUID
-	OccurredAt       time.Time
-	EventType        string
-	EntityType       string
-	EntityBusinessID string
-	EntityID         *uuid.UUID
-	RelatedIDs       map[string]any
-	ActorUserID      *uuid.UUID
-	SourceService    string
-	Payload          map[string]any
-	IdempotencyKey   *string
-	CreatedAt        time.Time
+	ID               uuid.UUID      `json:"id"`
+	OccurredAt       time.Time      `json:"occurred_at"`
+	EventType        string         `json:"event_type"`
+	EntityType       string         `json:"entity_type"`
+	EntityBusinessID string         `json:"entity_business_id"`
+	EntityID         *uuid.UUID     `json:"entity_id,omitempty"`
+	RelatedIDs       map[string]any `json:"related_ids,omitempty"`
+	ActorUserID      *uuid.UUID     `json:"actor_user_id,omitempty"`
+	SourceService    string         `json:"source_service"`
+	Payload          map[string]any `json:"payload,omitempty"`
+	IdempotencyKey   *string        `json:"idempotency_key,omitempty"`
+	CreatedAt        time.Time      `json:"created_at"`
 }
 
 type AppendEventInput struct {
@@ -130,8 +130,8 @@ type LotQR struct {
 	ScanCount     int64
 }
 
-func (s *Store) UpsertLotQR(ctx context.Context, lotBusinessID, token string) error {
-	_, err := s.pool.Exec(ctx, `
+func upsertLotQR(ctx context.Context, q execer, lotBusinessID, token string) error {
+	_, err := q.Exec(ctx, `
 		INSERT INTO lot_qr_codes (lot_business_id, public_token, version, published_at)
 		VALUES ($1, $2, 1, now())
 		ON CONFLICT (lot_business_id) DO UPDATE SET
@@ -142,6 +142,28 @@ func (s *Store) UpsertLotQR(ctx context.Context, lotBusinessID, token string) er
 			updated_at = now()`,
 		lotBusinessID, token)
 	return err
+}
+
+func (s *Store) UpsertLotQR(ctx context.Context, lotBusinessID, token string) error {
+	return upsertLotQR(ctx, s.pool, lotBusinessID, token)
+}
+
+// UpsertLotQRTx upserts the QR token and enqueues its outbox event in ONE
+// transaction, so the published QR and the scm.lot.qr_published event commit
+// atomically (transactional outbox).
+func (s *Store) UpsertLotQRTx(ctx context.Context, lotBusinessID, token string, outbox OutboxRow) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := upsertLotQR(ctx, tx, lotBusinessID, token); err != nil {
+		return err
+	}
+	if err := enqueueOutbox(ctx, tx, outbox); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) GetLotQRByToken(ctx context.Context, token string) (LotQR, error) {
@@ -212,8 +234,8 @@ func (s *Store) GetEntityProjection(ctx context.Context, entityType, businessID 
 	return payload, err
 }
 
-func (s *Store) RevokeLotQR(ctx context.Context, lotBusinessID string) error {
-	tag, err := s.pool.Exec(ctx, `
+func revokeLotQR(ctx context.Context, q execer, lotBusinessID string) error {
+	tag, err := q.Exec(ctx, `
 		UPDATE lot_qr_codes SET revoked_at = now(), updated_at = now()
 		WHERE lot_business_id = $1 AND revoked_at IS NULL`, lotBusinessID)
 	if err != nil {
@@ -223,6 +245,28 @@ func (s *Store) RevokeLotQR(ctx context.Context, lotBusinessID string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) RevokeLotQR(ctx context.Context, lotBusinessID string) error {
+	return revokeLotQR(ctx, s.pool, lotBusinessID)
+}
+
+// RevokeLotQRTx revokes the QR and enqueues its outbox event in ONE
+// transaction. Returns ErrNotFound (rolling back) when no active QR exists, so
+// no spurious qr_revoked event is emitted.
+func (s *Store) RevokeLotQRTx(ctx context.Context, lotBusinessID string, outbox OutboxRow) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := revokeLotQR(ctx, tx, lotBusinessID); err != nil {
+		return err
+	}
+	if err := enqueueOutbox(ctx, tx, outbox); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) GetLotQRByLotID(ctx context.Context, lotBusinessID string) (LotQR, error) {
