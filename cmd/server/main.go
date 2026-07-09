@@ -67,7 +67,10 @@ func main() {
 		}
 	}
 
-	st := store.New(pool)
+	st := store.New(pool).SetChainEnabled(cfg.ChainEnabled)
+	if cfg.ChainEnabled {
+		log.Printf("[traceability] custody hash-chain ENABLED")
+	}
 	auditStore := auditlog.NewStore(pool)
 
 	scm := scmclient.New(

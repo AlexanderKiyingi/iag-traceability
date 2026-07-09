@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,12 +14,22 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool         *pgxpool.Pool
+	chainEnabled bool
 }
 
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
+
+// SetChainEnabled toggles tamper-evident custody-chain appends for batch events.
+func (s *Store) SetChainEnabled(b bool) *Store {
+	s.chainEnabled = b
+	return s
+}
+
+// ChainEnabled reports whether custody-chain appends are active.
+func (s *Store) ChainEnabled() bool { return s.chainEnabled }
 
 func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
@@ -64,6 +75,12 @@ func (s *Store) AppendEvent(ctx context.Context, in AppendEventInput) (TraceEven
 	}
 	if in.Payload == nil {
 		in.Payload = map[string]any{}
+	}
+
+	// Batch events are appended to the tamper-evident custody chain (when enabled)
+	// atomically with the event insert; everything else uses the plain path.
+	if s.chainEnabled && strings.EqualFold(in.EntityType, "batch") {
+		return s.appendEventChained(ctx, in)
 	}
 
 	var ev TraceEvent

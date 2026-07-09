@@ -65,6 +65,9 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 	}
 	{
 		v1.GET("/batches/:businessId/chain", appmw.RequirePermission("traceability.view_chain"), api.GetBatchChain)
+		// Tamper-evident custody hash-chain (populated when CHAIN_ENABLED).
+		v1.GET("/chain", appmw.RequirePermission("traceability.view_chain"), api.GetCustodyChain)
+		v1.GET("/chain/verify", appmw.RequirePermission("traceability.view_chain"), api.VerifyCustodyChain)
 		v1.GET("/events", appmw.RequirePermission("traceability.view_events"), api.ListEvents)
 		v1.POST("/events", appmw.RequirePermission("traceability.add_trace_event"), api.RecordEvent)
 		v1.POST("/lots/:businessId/publish", appmw.RequirePermission("traceability.publish_qr"), api.PublishLotQR)

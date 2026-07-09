@@ -61,6 +61,12 @@ type Config struct {
 	// exposes precise farm/farmer GPS coordinates. Default false: coordinates are
 	// coarsened (~1km) to protect smallholder location privacy.
 	PublicPreciseGeo bool
+
+	// ChainEnabled turns on the tamper-evident custody hash-chain: batch trace
+	// events are appended to custody_chain (hash-linked, advisory-locked) and the
+	// /chain/verify endpoint walks it. Default false — the chain is opt-in so it
+	// does not affect event ingestion until a deployment enables it.
+	ChainEnabled bool
 }
 
 func Load() (*Config, error) {
@@ -82,6 +88,7 @@ func Load() (*Config, error) {
 		DatabaseURL:             strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		RedisURL:                getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
 		AutoMigrate:             getenv("AUTO_MIGRATE", "true") != "false",
+		ChainEnabled:            getenv("CHAIN_ENABLED", "false") == "true",
 		AuthMode:                authMode,
 		JWTIssuer:               getenv("JWT_ISSUER", "http://localhost:3001"),
 		JWKSURL:                 getenv("JWKS_URL", "http://localhost:3001/.well-known/jwks.json"),
