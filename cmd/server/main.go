@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/alvor-technologies/iag-platform-go/authclient"
 	platformotel "github.com/alvor-technologies/iag-platform-go/otel"
 
+	"iag-traceability/backend/internal/anchor"
 	"iag-traceability/backend/internal/auditlog"
 	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/config"
@@ -144,6 +146,35 @@ func main() {
 		go kafkabus.NewRelay(st, kafkaPub).Run(ctx)
 	}
 
+	// L2 notarization / L3 anchoring. Opt-in (ANCHOR_ENABLED): a signer attests a
+	// Merkle root of custody blocks, an optional provider posts it on-chain. A
+	// misconfigured signer/provider is fatal at boot — silently degrading to an
+	// unsigned "notarization" would be worse than not offering it.
+	var anchorSvc *anchor.Service
+	if cfg.AnchorEnabled {
+		signer, err := anchor.NewSigner(anchor.SignerConfig{
+			Algo:       cfg.AnchorSigningAlgo,
+			KeyID:      cfg.AnchorKeyID,
+			KeyHex:     cfg.AnchorSigningKey,
+			VaultAddr:  cfg.VaultAddr,
+			VaultToken: cfg.VaultToken,
+			VaultMount: cfg.VaultTransitMount,
+			VaultKey:   cfg.VaultTransitKey,
+		})
+		if err != nil {
+			log.Fatalf("anchor signer: %v", err)
+		}
+		provider, err := anchor.NewProvider(cfg.AnchorProvider, cfg.AnchorRPCURL, cfg.AnchorContract)
+		if err != nil {
+			log.Fatalf("anchor provider: %v", err)
+		}
+		anchorSvc = anchor.NewService(st, signer, provider)
+		log.Printf("[traceability] notarization ENABLED (algo=%s provider=%s)", signer.Algo(), provider.Name())
+		if cfg.AnchorInterval > 0 {
+			go anchorJobLoop(ctx, anchorSvc, cfg.AnchorInterval)
+		}
+	}
+
 	api := &handlers.API{
 		Cfg:             cfg,
 		Store:           st,
@@ -151,6 +182,7 @@ func main() {
 		KafkaPub:        kafkaPub,
 		QRCache:         qrCache,
 		ConsumerMetrics: consumerMetrics,
+		Anchor:          anchorSvc,
 	}
 	router := handlers.NewRouter(handlers.RouterDeps{
 		API:              api,
@@ -234,6 +266,32 @@ func jwksRefreshLoop(ctx context.Context, v *authclient.Verifier) {
 				log.Printf("jwks refresh: %v", err)
 			}
 			cancel()
+		}
+	}
+}
+
+// anchorJobLoop periodically notarizes any custody blocks appended since the
+// last anchor. ErrNothingToAnchor is the steady state and is not logged as an
+// error; anything else is surfaced for ops monitoring.
+func anchorJobLoop(ctx context.Context, svc *anchor.Service, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			jobCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			row, err := svc.CreateAnchor(jobCtx)
+			cancel()
+			switch {
+			case err == nil:
+				log.Printf("[anchor] notarized blocks %d..%d (%d events) root=%s", row.FromSeq, row.ToSeq, row.EventCount, row.MerkleRoot)
+			case errors.Is(err, anchor.ErrNothingToAnchor):
+				// steady state — nothing new to anchor
+			default:
+				log.Printf("[anchor] notarization job failed: %v", err)
+			}
 		}
 	}
 }

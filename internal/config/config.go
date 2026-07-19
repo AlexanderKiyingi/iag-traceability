@@ -67,6 +67,31 @@ type Config struct {
 	// /chain/verify endpoint walks it. Default false — the chain is opt-in so it
 	// does not affect event ingestion until a deployment enables it.
 	ChainEnabled bool
+
+	// --- L2 notarization / L3 public anchoring (all opt-in) ---
+	// AnchorEnabled turns on the /v1/anchors API and the background notarizer.
+	AnchorEnabled bool
+	// AnchorInterval is how often the background job auto-notarizes new blocks.
+	// Zero disables the job (anchors can still be created via POST /v1/anchors).
+	AnchorInterval time.Duration
+	// AnchorSigningAlgo: none | hmac-sha256 | ed25519.
+	AnchorSigningAlgo string
+	// AnchorKeyID identifies the signing key (stored on each anchor for rotation).
+	AnchorKeyID string
+	// AnchorSigningKey is the hex key material (HMAC secret or ed25519 seed).
+	AnchorSigningKey string
+	// AnchorProvider selects the L3 public ledger: none | polygon. Default none.
+	AnchorProvider string
+	// AnchorRPCURL / AnchorContract configure the L3 provider when not "none".
+	AnchorRPCURL   string
+	AnchorContract string
+
+	// Vault Transit signing (used when AnchorSigningAlgo=vault-transit): the L2
+	// signing key stays in Vault and never touches the service process.
+	VaultAddr         string
+	VaultToken        string
+	VaultTransitMount string
+	VaultTransitKey   string
 }
 
 func Load() (*Config, error) {
@@ -89,6 +114,18 @@ func Load() (*Config, error) {
 		RedisURL:                getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
 		AutoMigrate:             getenv("AUTO_MIGRATE", "true") != "false",
 		ChainEnabled:            getenv("CHAIN_ENABLED", "false") == "true",
+		AnchorEnabled:           getEnvBool("ANCHOR_ENABLED", false),
+		AnchorInterval:          getEnvDuration("ANCHOR_INTERVAL", "0s"),
+		AnchorSigningAlgo:       getenv("ANCHOR_SIGNING_ALGO", "none"),
+		AnchorKeyID:             getenv("ANCHOR_KEY_ID", ""),
+		AnchorSigningKey:        strings.TrimSpace(os.Getenv("ANCHOR_SIGNING_KEY")),
+		AnchorProvider:          getenv("ANCHOR_PROVIDER", "none"),
+		AnchorRPCURL:            strings.TrimSpace(os.Getenv("ANCHOR_RPC_URL")),
+		AnchorContract:          strings.TrimSpace(os.Getenv("ANCHOR_CONTRACT_ADDRESS")),
+		VaultAddr:               strings.TrimSpace(os.Getenv("VAULT_ADDR")),
+		VaultToken:              strings.TrimSpace(os.Getenv("VAULT_TOKEN")),
+		VaultTransitMount:       getenv("VAULT_TRANSIT_MOUNT", "transit"),
+		VaultTransitKey:         strings.TrimSpace(os.Getenv("VAULT_TRANSIT_KEY")),
 		AuthMode:                authMode,
 		JWTIssuer:               getenv("JWT_ISSUER", "http://localhost:3001"),
 		JWKSURL:                 getenv("JWKS_URL", "http://localhost:3001/.well-known/jwks.json"),

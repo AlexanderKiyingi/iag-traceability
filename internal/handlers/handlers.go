@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"iag-traceability/backend/internal/anchor"
 	"iag-traceability/backend/internal/auditlog"
 	"iag-traceability/backend/internal/cache"
 	"iag-traceability/backend/internal/config"
@@ -28,6 +29,8 @@ type API struct {
 	KafkaPub        *kafkabus.Publisher
 	QRCache         *cache.JSONCache
 	ConsumerMetrics *metrics.Counters
+	// Anchor is the L2/L3 notarization service; nil when anchoring is disabled.
+	Anchor *anchor.Service
 }
 
 const (
