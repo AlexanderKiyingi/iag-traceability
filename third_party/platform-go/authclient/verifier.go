@@ -131,6 +131,16 @@ func (v *Verifier) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// HasKeys reports whether the verifier currently holds at least one signing
+// key. With an empty key set every token fails closed with "unknown kid", so
+// callers use this to tell "auth is degraded, retry the JWKS fetch hard" apart
+// from the healthy steady state.
+func (v *Verifier) HasKeys() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return len(v.keys) > 0
+}
+
 // StartRefreshLoop runs Refresh on every interval until ctx is cancelled.
 func (v *Verifier) StartRefreshLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {

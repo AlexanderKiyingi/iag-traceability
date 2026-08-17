@@ -253,19 +253,43 @@ func refreshJWKSWithRetry(ctx context.Context, v *authclient.Verifier) error {
 	return err
 }
 
+// jwksRefreshLoop keeps the key set current at two speeds: the steady rotation
+// interval once keys are loaded, and a much shorter one while the set is empty.
+//
+// A flat 15 minute tick was the problem: boot already tolerates a missing JWKS
+// and fails closed until keys arrive, but if the auth service restarts and this
+// service happens to hold nothing, every authenticated request is rejected for
+// up to a quarter of an hour. Observed in the wild — a group of services 401'd
+// together for a few minutes after an auth restart while those with a fast
+// refresh never blipped.
 func jwksRefreshLoop(ctx context.Context, v *authclient.Verifier) {
-	ticker := time.NewTicker(15 * time.Minute)
-	defer ticker.Stop()
+	const (
+		steadyInterval   = 15 * time.Minute
+		degradedInterval = 15 * time.Second
+	)
 	for {
+		wait := steadyInterval
+		if !v.HasKeys() {
+			wait = degradedInterval
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := v.Refresh(refreshCtx); err != nil {
-				log.Printf("jwks refresh: %v", err)
-			}
-			cancel()
+		case <-time.After(wait):
+		}
+
+		hadKeys := v.HasKeys()
+		refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := v.Refresh(refreshCtx)
+		cancel()
+		switch {
+		case err != nil && hadKeys:
+			// Previous key set is still in memory; tokens keep verifying.
+			log.Printf("jwks refresh failed; serving with the previous key set: %v", err)
+		case err != nil:
+			log.Printf("jwks still unavailable; all authenticated requests are being rejected: %v", err)
+		case !hadKeys:
+			log.Printf("jwks recovered; token verification restored")
 		}
 	}
 }
