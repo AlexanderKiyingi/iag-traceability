@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	platformdb "github.com/alvor-technologies/iag-platform-go/db"
 )
 
 type Store struct {
@@ -30,8 +32,13 @@ func (s *Store) ListAPIAuditLogs(ctx context.Context, limit int) ([]map[string]a
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	var total int
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM traceability_api_audit`).Scan(&total); err != nil {
+	// Bounded: traceability_api_audit takes a row per API request, so an unqualified
+	// COUNT(*) here is a full scan of the fastest-growing table in the
+	// service, run to put a number beside at most 200 rows. A total equal
+	// to the cap means "at least this many" — see platformdb.IsCapped.
+	total, _, err := platformdb.CountBounded(ctx, s.pool, platformdb.DefaultCountCap,
+		"FROM traceability_api_audit")
+	if err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.pool.Query(ctx, `
