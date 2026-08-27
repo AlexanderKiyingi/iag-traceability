@@ -94,7 +94,7 @@ func execSQL(ctx context.Context, tx pgx.Tx, sql string) error {
 	if sql == "" {
 		return nil
 	}
-	for _, chunk := range strings.Split(sql, ";\n\n") {
+	for _, chunk := range splitStatements(sql) {
 		chunk = strings.TrimSpace(chunk)
 		if chunk == "" {
 			continue
@@ -108,4 +108,58 @@ func execSQL(ctx context.Context, tx pgx.Tx, sql string) error {
 		}
 	}
 	return nil
+}
+
+// splitStatements splits a migration into chunks on a ";" followed by a blank
+// line, but never inside a dollar-quoted block.
+//
+// The previous strings.Split(sql, ";\n\n") had no notion of quoting, so a
+// DO $tag$ ... $tag$ body containing a statement followed by a blank line -
+// ordinary formatting inside PL/pgSQL - was cut in half and both halves sent as
+// invalid SQL. MES 008_machine_telemetry_policies could never be applied for exactly
+// that reason: its "END IF;" is followed by a blank line, and Postgres rejected
+// the fragment with "unterminated dollar-quoted string".
+func splitStatements(sql string) []string {
+	var out []string
+	start := 0
+	tag := "" // the open dollar-quote tag, empty when outside one
+	for i := 0; i < len(sql); i++ {
+		if tag != "" {
+			if sql[i] == '$' && strings.HasPrefix(sql[i:], tag) {
+				i += len(tag) - 1
+				tag = ""
+			}
+			continue
+		}
+		if sql[i] == '$' {
+			if t := dollarTagAt(sql[i:]); t != "" {
+				tag = t
+				i += len(t) - 1
+				continue
+			}
+		}
+		if sql[i] == ';' && strings.HasPrefix(sql[i:], ";\n\n") {
+			out = append(out, sql[start:i+1])
+			start = i + 1
+		}
+	}
+	return append(out, sql[start:])
+}
+
+// dollarTagAt returns the dollar-quote tag opening at s (e.g. "$$" or "$body$"),
+// or "" if s does not open one.
+func dollarTagAt(s string) string {
+	j := 1
+	for j < len(s) {
+		c := s[j]
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			j++
+			continue
+		}
+		break
+	}
+	if j < len(s) && s[j] == '$' {
+		return s[:j+1]
+	}
+	return ""
 }
