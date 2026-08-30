@@ -18,6 +18,7 @@ import (
 	"iag-traceability/backend/internal/kafkabus"
 	"iag-traceability/backend/internal/metrics"
 	"iag-traceability/backend/internal/middleware"
+	"iag-traceability/backend/internal/notify"
 	"iag-traceability/backend/internal/store"
 	"iag-traceability/backend/internal/story"
 )
@@ -31,6 +32,8 @@ type API struct {
 	ConsumerMetrics *metrics.Counters
 	// Anchor is the L2/L3 notarization service; nil when anchoring is disabled.
 	Anchor *anchor.Service
+	// Notify raises operational alerts by email. nil disables them.
+	Notify *notify.Publisher
 }
 
 const (
@@ -38,6 +41,10 @@ const (
 	maxEventBodyBytes = 256 * 1024
 	// maxOccurredAtSkew tolerates minor clock drift when validating occurred_at.
 	maxOccurredAtSkew = 5 * time.Minute
+	// complianceGateAlertWindow throttles the gate-unavailable alert. Long
+	// enough that a sustained outage produces a handful of mails rather than
+	// one per blocked publish, short enough to re-notify on a fresh incident.
+	complianceGateAlertWindow = 30 * time.Minute
 )
 
 // validEntityType is the allowlist of entity classes the trace store and story
@@ -232,16 +239,19 @@ func (a *API) maybeRebuildLotStory(ctx context.Context, eventType, entityType, e
 func (a *API) ListEvents(c *gin.Context) {
 	entityType := c.Query("entity_type")
 	businessID := c.Query("entity_business_id")
-	if entityType == "" || businessID == "" {
-		apierr.BadRequest(c, "entity_type and entity_business_id query params are required")
-		return
-	}
-	if !validEntityType(entityType) {
-		apierr.BadRequest(c, "entity_type must be one of: lot, batch, farm, party")
+	scoped, reason := eventFilterMode(entityType, businessID)
+	if reason != "" {
+		apierr.BadRequest(c, reason)
 		return
 	}
 	limit := parseLimit(c.Query("limit"))
-	events, err := a.Store.ListEventsForEntity(c.Request.Context(), entityType, businessID, limit+1)
+	var events []store.TraceEvent
+	var err error
+	if scoped {
+		events, err = a.Store.ListEventsForEntity(c.Request.Context(), entityType, businessID, limit+1)
+	} else {
+		events, err = a.Store.ListRecentEvents(c.Request.Context(), limit+1)
+	}
 	if err != nil {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to list events")
 		return
@@ -254,6 +264,19 @@ func (a *API) PublishLotQR(c *gin.Context) {
 	lotID := c.Param("businessId")
 	if err := story.ValidateLotPublish(c.Request.Context(), a.Store, lotID); err != nil {
 		if err == story.ErrComplianceGateUnavailable {
+			// SCM being unreachable blocks every QR publish platform-wide, and
+			// the only trace was a 503 to whoever happened to click. Tell the
+			// ops desk, throttled: the condition fails on every attempt while
+			// it lasts, so an unthrottled alert would flood the very inbox
+			// that needs to be readable during the incident.
+			if a.Notify != nil {
+				a.Notify.AlertOnce(c.Request.Context(), "compliance-gate-unavailable",
+					"Traceability compliance gate is unavailable",
+					"QR publishing is blocked for every lot: the SCM compliance gate is configured "+
+						"but unreachable. Publishes will keep returning 503 until SCM recovers. "+
+						"Most recent attempt was for lot "+lotID+".",
+					complianceGateAlertWindow)
+			}
 			apierr.Write(c, http.StatusServiceUnavailable, apierr.CodeServiceUnavailable, err.Error())
 			return
 		}
@@ -363,4 +386,27 @@ func (a *API) PublicQRPng(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "image/png", png)
+}
+
+// eventFilterMode decides whether a ListEvents call is scoped to one entity.
+//
+// The rule is both filters or neither. Requiring them unconditionally — which
+// is what this service used to do — meant the event ledger, a page with no
+// entity in hand, had no endpoint it could call at all. Accepting half a filter
+// would be worse than either: `?entity_type=batch` alone reads as "every batch
+// event" and would quietly return every event of every kind.
+//
+// Returns the scope decision and, when the request is malformed, the reason to
+// refuse it with.
+func eventFilterMode(entityType, businessID string) (scoped bool, reason string) {
+	if entityType == "" && businessID == "" {
+		return false, ""
+	}
+	if entityType == "" || businessID == "" {
+		return false, "entity_type and entity_business_id must be given together"
+	}
+	if !validEntityType(entityType) {
+		return false, "entity_type must be one of: lot, batch, farm, party"
+	}
+	return true, ""
 }

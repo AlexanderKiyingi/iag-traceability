@@ -22,6 +22,7 @@ import (
 	"iag-traceability/backend/internal/handlers"
 	"iag-traceability/backend/internal/kafkabus"
 	"iag-traceability/backend/internal/metrics"
+	"iag-traceability/backend/internal/notify"
 	"iag-traceability/backend/internal/middleware"
 	"iag-traceability/backend/internal/migrate"
 	"iag-traceability/backend/internal/scmclient"
@@ -124,6 +125,12 @@ func main() {
 	}
 
 	kafkaPub := kafkabus.NewPublisher(cfg.KafkaBrokers, cfg.KafkaClientID)
+
+	// Operational alerts by email. Publishes notification.requested on
+	// iag.notifications, so it needs no consumer of its own; a no-op when
+	// Kafka is not configured.
+	notifier := notify.New(notify.Config{Brokers: cfg.KafkaBrokers, ClientID: cfg.KafkaClientID})
+	defer func() { _ = notifier.Close() }()
 	consumerMetrics := metrics.New()
 	if len(cfg.KafkaBrokers) > 0 {
 		kc := consumer.New(consumer.Config{
