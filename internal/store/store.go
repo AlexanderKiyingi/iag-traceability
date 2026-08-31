@@ -106,16 +106,43 @@ func (s *Store) AppendEvent(ctx context.Context, in AppendEventInput) (TraceEven
 }
 
 func (s *Store) ListEventsForEntity(ctx context.Context, entityType, businessID string, limit int) ([]TraceEvent, error) {
+	return s.listEvents(ctx, entityType, businessID, limit)
+}
+
+// ListRecentEvents returns the newest events across every entity.
+//
+// The per-entity list above answers "what happened to this batch", which is the
+// right question for a drill-down and the wrong one for a ledger page: a ledger
+// has no entity in hand, and both this service and iag-supply-chain previously
+// required one. That left the event ledger with no endpoint it could call at
+// all.
+//
+// Ordered newest-first, unlike the per-entity list — a chain of custody is read
+// forwards, a ledger is read backwards.
+func (s *Store) ListRecentEvents(ctx context.Context, limit int) ([]TraceEvent, error) {
+	return s.listEvents(ctx, "", "", limit)
+}
+
+func (s *Store) listEvents(ctx context.Context, entityType, businessID string, limit int) ([]TraceEvent, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.pool.Query(ctx, `
+	q := `
 		SELECT id, occurred_at, event_type, entity_type, entity_business_id, entity_id,
 			source_service, related_ids, payload, created_at
-		FROM trace_events
-		WHERE entity_type = $1 AND entity_business_id = $2
-		ORDER BY occurred_at ASC
-		LIMIT $3`, entityType, businessID, limit)
+		FROM trace_events`
+	args := []any{}
+	scoped := entityType != "" && businessID != ""
+	if scoped {
+		q += ` WHERE entity_type = $1 AND entity_business_id = $2`
+		args = append(args, entityType, businessID)
+		q += ` ORDER BY occurred_at ASC LIMIT $3`
+	} else {
+		q += ` ORDER BY occurred_at DESC LIMIT $1`
+	}
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
