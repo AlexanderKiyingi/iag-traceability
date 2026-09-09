@@ -31,13 +31,17 @@ jobs:
         with:
           go-version: "1.25"
 
-      - name: Fetch platform-go from meta-repo
-        run: |
-          git clone --depth 1 --branch main https://github.com/AlexanderKiyingi/IAG_multi_backend.git /tmp/iag-meta
-          mkdir -p /tmp/deps
-          mv /tmp/iag-meta/shared/platform-go /tmp/deps/platform-go
-          rm -rf /tmp/iag-meta
-          go mod edit -replace=github.com/alvor-technologies/iag-platform-go=/tmp/deps/platform-go
+      # go.mod carries a meta-repo-only replace, which does not resolve in a
+      # standalone checkout. This step used to fix that by cloning the meta-repo,
+      # but that repo is private and a `run:` step carries no credentials, so
+      # every run since this step was added has died with
+      # "fatal: could not read Username for 'https://github.com'" before the
+      # compiler was ever reached.
+      #
+      # Build against the committed snapshot instead, as the standalone
+      # Dockerfile target does. Refresh it with scripts/sync-platform-go.sh.
+      - name: Point platform-go at the vendored snapshot
+        run: go mod edit -replace=github.com/alvor-technologies/iag-platform-go=./third_party/platform-go
 
       - name: go mod tidy
         run: go mod tidy
