@@ -262,6 +262,13 @@ func (a *API) ListEvents(c *gin.Context) {
 
 func (a *API) PublishLotQR(c *gin.Context) {
 	lotID := c.Param("businessId")
+	// A QR printed with the default localhost address leads nowhere; refuse
+	// to mint one outside local development until the public address is set.
+	if a.Cfg != nil && !a.Cfg.LocalEnvironment() && !a.Cfg.PublicTraceURLConfigured() {
+		apierr.Write(c, http.StatusServiceUnavailable, apierr.CodeServiceUnavailable,
+			"PUBLIC_TRACE_BASE_URL is not set to a public address; a QR published now would point nowhere")
+		return
+	}
 	if err := story.ValidateLotPublish(c.Request.Context(), a.Store, lotID); err != nil {
 		if err == story.ErrComplianceGateUnavailable {
 			// SCM being unreachable blocks every QR publish platform-wide, and
@@ -358,7 +365,9 @@ func (a *API) PublicQR(c *gin.Context) {
 			return
 		}
 	}
-	c.Header("Cache-Control", "public, max-age=300, s-maxage=3600")
+	// Short: a revoked QR must stop working within a minute, not stay live in
+	// a CDN for an hour. Revoking also clears the service's own cache.
+	c.Header("Cache-Control", "public, max-age=60, s-maxage=60")
 	c.Header("Vary", "Accept-Encoding")
 	c.JSON(http.StatusOK, payload)
 }
