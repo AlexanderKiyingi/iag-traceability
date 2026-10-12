@@ -149,7 +149,7 @@ func Load() (*Config, error) {
 		PublicRateBurst:         getEnvInt("PUBLIC_RATE_BURST", 10),
 		CacheTTL:                getEnvDuration("CACHE_TTL", "5m"),
 		StoryPlaceholderJourney: getEnvBool("STORY_PLACEHOLDER_JOURNEY", env != "production"),
-		TrustedProxies:          splitCSV(getenv("TRUSTED_PROXIES", "")),
+		TrustedProxies:          splitCSV(getenv("TRUSTED_PROXIES", strings.Join(PrivateNetworks, ","))),
 		PublicPreciseGeo:        getEnvBool("PUBLIC_PRECISE_GEO", false),
 	}
 
@@ -253,4 +253,36 @@ func getEnvBool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// PrivateNetworks are the ranges a gateway on the platform's internal network
+// connects from. Trusting X-Forwarded-For from these by default lets the
+// public rate limiter see each visitor behind the gateway, instead of one
+// shared bucket for everyone; a client on the public internet is never in
+// them, so it still cannot forge its address.
+var PrivateNetworks = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"}
+
+// PublicTraceURLConfigured reports whether QR links would point somewhere a
+// phone can reach. The default is a localhost address, and a QR printed with
+// it leads nowhere.
+func (c *Config) PublicTraceURLConfigured() bool {
+	u := strings.ToLower(strings.TrimSpace(c.PublicTraceBaseURL))
+	if u == "" {
+		return false
+	}
+	for _, local := range []string{"localhost", "127.0.0.1", "0.0.0.0", "[::1]"} {
+		if strings.Contains(u, local) {
+			return false
+		}
+	}
+	return true
+}
+
+// LocalEnvironment is development or test, where a localhost QR is fine.
+func (c *Config) LocalEnvironment() bool {
+	switch c.Environment {
+	case "", "development", "dev", "local", "test":
+		return true
+	}
+	return false
 }

@@ -22,9 +22,9 @@ import (
 	"iag-traceability/backend/internal/handlers"
 	"iag-traceability/backend/internal/kafkabus"
 	"iag-traceability/backend/internal/metrics"
-	"iag-traceability/backend/internal/notify"
 	"iag-traceability/backend/internal/middleware"
 	"iag-traceability/backend/internal/migrate"
+	"iag-traceability/backend/internal/notify"
 	"iag-traceability/backend/internal/scmclient"
 	"iag-traceability/backend/internal/store"
 	"iag-traceability/backend/internal/story"
@@ -190,6 +190,9 @@ func main() {
 		QRCache:         qrCache,
 		ConsumerMetrics: consumerMetrics,
 		Anchor:          anchorSvc,
+	}
+	if !cfg.LocalEnvironment() && !cfg.PublicTraceURLConfigured() {
+		log.Printf("traceability: PUBLIC_TRACE_BASE_URL is %q — QR publishing is refused until it is set to the public trace address", cfg.PublicTraceBaseURL)
 	}
 	router := handlers.NewRouter(handlers.RouterDeps{
 		API:              api,

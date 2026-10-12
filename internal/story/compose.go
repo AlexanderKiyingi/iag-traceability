@@ -65,9 +65,9 @@ func RebuildLotProjection(ctx context.Context, st *store.Store, scm *scmclient.C
 			return preview, nil
 		}
 		if lot, err := scm.GetExportLot(ctx, lotBusinessID); err == nil {
+			// No buyer: who bought a lot is commercial, not the consumer's story.
 			story["lot"] = map[string]any{
 				"business_id": lot.BusinessID,
-				"buyer_name":  lot.BuyerName,
 				"destination": lot.Destination,
 				"batch_ids":   lot.BatchIDs,
 			}
@@ -279,6 +279,7 @@ func redactPublicEntity(entry map[string]any) {
 // sanitizePreviewEntities redacts the farmers/farms arrays of an SCM preview,
 // which is otherwise returned verbatim and bypasses per-entity enrichment.
 func sanitizePreviewEntities(preview map[string]any) {
+	stripCommercial(preview)
 	for _, key := range []string{"farmers", "farms"} {
 		switch arr := preview[key].(type) {
 		case []map[string]any:
@@ -407,5 +408,31 @@ func defaultJourney() []map[string]any {
 		{"stage": "Wet mill", "source": "mes", "summary": "Processing"},
 		{"stage": "Lab", "source": "qc", "summary": "Quality analysis"},
 		{"stage": "Export", "source": "scm", "summary": "Export lot"},
+	}
+}
+
+// commercialKeys are fields the public story never carries, wherever they
+// appear in an upstream payload: who bought the coffee and on what terms.
+var commercialKeys = []string{"buyer_name", "buyer", "buyer_id", "buyer_ref", "customer", "customer_name",
+	"price", "unit_price", "contract_price", "contract_ref", "sales_order", "sales_order_id"}
+
+// stripCommercial removes commercialKeys from m and everything nested in it.
+func stripCommercial(v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		for _, k := range commercialKeys {
+			delete(t, k)
+		}
+		for _, child := range t {
+			stripCommercial(child)
+		}
+	case []any:
+		for _, child := range t {
+			stripCommercial(child)
+		}
+	case []map[string]any:
+		for _, child := range t {
+			stripCommercial(child)
+		}
 	}
 }
