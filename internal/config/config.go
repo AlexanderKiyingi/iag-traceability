@@ -68,6 +68,18 @@ type Config struct {
 	// does not affect event ingestion until a deployment enables it.
 	ChainEnabled bool
 
+	// --- SCM same-database custody sync (internal/scmsync) ---
+	// SCMSyncEnabled runs the background loop that copies SCM's
+	// public.trace_events (and lot_qr_codes) into this service. Default false.
+	SCMSyncEnabled bool
+	// SCMSyncInterval is the tick period. Default 60s.
+	SCMSyncInterval time.Duration
+	// SCMSyncSameDB reads SCM's tables through this service's own pool
+	// (schema-qualified public.*). Defaults to true when SCMDatabaseURL is empty.
+	SCMSyncSameDB bool
+	// SCMDatabaseURL points at a separate SCM database when SCMSyncSameDB is false.
+	SCMDatabaseURL string
+
 	// --- L2 notarization / L3 public anchoring (all opt-in) ---
 	// AnchorEnabled turns on the /v1/anchors API and the background notarizer.
 	AnchorEnabled bool
@@ -114,6 +126,10 @@ func Load() (*Config, error) {
 		RedisURL:                getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
 		AutoMigrate:             getenv("AUTO_MIGRATE", "true") != "false",
 		ChainEnabled:            getenv("CHAIN_ENABLED", "false") == "true",
+		SCMSyncEnabled:          getEnvBool("SCM_SYNC_ENABLED", false),
+		SCMSyncInterval:         getEnvDuration("SCM_SYNC_INTERVAL", "60s"),
+		SCMDatabaseURL:          strings.TrimSpace(os.Getenv("SCM_DATABASE_URL")),
+		SCMSyncSameDB:           getEnvBool("SCM_SYNC_SAME_DB", strings.TrimSpace(os.Getenv("SCM_DATABASE_URL")) == ""),
 		AnchorEnabled:           getEnvBool("ANCHOR_ENABLED", false),
 		AnchorInterval:          getEnvDuration("ANCHOR_INTERVAL", "0s"),
 		AnchorSigningAlgo:       getenv("ANCHOR_SIGNING_ALGO", "none"),

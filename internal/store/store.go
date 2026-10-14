@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,6 +49,9 @@ type TraceEvent struct {
 	Payload          map[string]any `json:"payload,omitempty"`
 	IdempotencyKey   *string        `json:"idempotency_key,omitempty"`
 	CreatedAt        time.Time      `json:"created_at"`
+	// Inserted is true when AppendEvent wrote a new row, false when an
+	// idempotency_key replay returned the existing one. Not serialised.
+	Inserted bool `json:"-"`
 }
 
 type AppendEventInput struct {
@@ -92,12 +96,12 @@ func (s *Store) AppendEvent(ctx context.Context, in AppendEventInput) (TraceEven
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 		RETURNING id, occurred_at, event_type, entity_type, entity_business_id, entity_id,
-			source_service, created_at`,
+			source_service, created_at, (xmax = 0) AS inserted`,
 		in.OccurredAt, in.EventType, in.EntityType, in.EntityBusinessID, in.EntityID,
 		in.RelatedIDs, in.ActorUserID, in.SourceService, in.Payload, in.IdempotencyKey,
 	).Scan(
 		&ev.ID, &ev.OccurredAt, &ev.EventType, &ev.EntityType, &ev.EntityBusinessID, &ev.EntityID,
-		&ev.SourceService, &ev.CreatedAt,
+		&ev.SourceService, &ev.CreatedAt, &ev.Inserted,
 	)
 	ev.RelatedIDs = in.RelatedIDs
 	ev.Payload = in.Payload
@@ -124,23 +128,67 @@ func (s *Store) ListRecentEvents(ctx context.Context, limit int) ([]TraceEvent, 
 }
 
 func (s *Store) listEvents(ctx context.Context, entityType, businessID string, limit int) ([]TraceEvent, error) {
+	return s.ListEvents(ctx, EventFilter{EntityType: entityType, EntityBusinessID: businessID, Limit: limit})
+}
+
+// EventFilter narrows ListEvents. Every field is optional; the zero value is
+// the newest events across every entity (the global ledger).
+type EventFilter struct {
+	// EventTypes matches any of the listed types (OR).
+	EventTypes []string
+	// EntityType alone filters by entity class; together with
+	// EntityBusinessID it scopes the list to one entity, which is then read
+	// oldest-first (a chain of custody is read forwards).
+	EntityType       string
+	EntityBusinessID string
+	// From is inclusive, To is exclusive, both on occurred_at.
+	From *time.Time
+	To   *time.Time
+	// Limit is clamped to (0, 500]; 0 or out of range means 100.
+	Limit int
+}
+
+// ListEvents returns trace events matching f. A single-entity scope is ordered
+// oldest-first; every other list newest-first.
+func (s *Store) ListEvents(ctx context.Context, f EventFilter) ([]TraceEvent, error) {
+	limit := f.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	q := `
 		SELECT id, occurred_at, event_type, entity_type, entity_business_id, entity_id,
-			source_service, related_ids, payload, created_at
+			actor_user_id, source_service, related_ids, payload, created_at
 		FROM trace_events`
-	args := []any{}
-	scoped := entityType != "" && businessID != ""
-	if scoped {
-		q += ` WHERE entity_type = $1 AND entity_business_id = $2`
-		args = append(args, entityType, businessID)
-		q += ` ORDER BY occurred_at ASC LIMIT $3`
-	} else {
-		q += ` ORDER BY occurred_at DESC LIMIT $1`
+	var where []string
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
 	}
-	args = append(args, limit)
+	if f.EntityType != "" {
+		where = append(where, "entity_type = "+arg(f.EntityType))
+	}
+	if f.EntityBusinessID != "" {
+		where = append(where, "entity_business_id = "+arg(f.EntityBusinessID))
+	}
+	if len(f.EventTypes) > 0 {
+		where = append(where, "event_type = ANY("+arg(f.EventTypes)+"::text[])")
+	}
+	if f.From != nil {
+		where = append(where, "occurred_at >= "+arg(*f.From))
+	}
+	if f.To != nil {
+		where = append(where, "occurred_at < "+arg(*f.To))
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	if f.EntityType != "" && f.EntityBusinessID != "" {
+		q += " ORDER BY occurred_at ASC"
+	} else {
+		q += " ORDER BY occurred_at DESC"
+	}
+	q += " LIMIT " + arg(limit)
 
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -154,7 +202,7 @@ func (s *Store) listEvents(ctx context.Context, entityType, businessID string, l
 		var relatedIDs, payload map[string]any
 		if err := rows.Scan(
 			&ev.ID, &ev.OccurredAt, &ev.EventType, &ev.EntityType, &ev.EntityBusinessID, &ev.EntityID,
-			&ev.SourceService, &relatedIDs, &payload, &ev.CreatedAt,
+			&ev.ActorUserID, &ev.SourceService, &relatedIDs, &payload, &ev.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

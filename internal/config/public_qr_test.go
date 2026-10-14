@@ -41,3 +41,29 @@ func TestPrivateNetworksAreTheOnlyDefaultProxies(t *testing.T) {
 		t.Fatal("a public client must never be trusted to name its own address")
 	}
 }
+
+func TestSCMSyncDefaults(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://test")
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("SCM_SYNC_ENABLED", "")
+	t.Setenv("SCM_SYNC_INTERVAL", "")
+	t.Setenv("SCM_SYNC_SAME_DB", "")
+	t.Setenv("SCM_DATABASE_URL", "")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SCMSyncEnabled || c.SCMSyncInterval.String() != "1m0s" || !c.SCMSyncSameDB {
+		t.Fatalf("defaults: enabled=%v interval=%s sameDB=%v", c.SCMSyncEnabled, c.SCMSyncInterval, c.SCMSyncSameDB)
+	}
+	t.Setenv("SCM_DATABASE_URL", "postgres://scm")
+	if c, _ = Load(); c.SCMSyncSameDB {
+		t.Fatal("SCM_DATABASE_URL set: same-DB should default to false")
+	}
+	t.Setenv("SCM_SYNC_SAME_DB", "true")
+	t.Setenv("SCM_SYNC_ENABLED", "true")
+	t.Setenv("SCM_SYNC_INTERVAL", "15s")
+	if c, _ = Load(); !c.SCMSyncSameDB || !c.SCMSyncEnabled || c.SCMSyncInterval.String() != "15s" {
+		t.Fatalf("explicit: %+v", c)
+	}
+}

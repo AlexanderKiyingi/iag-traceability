@@ -12,6 +12,7 @@ import (
 
 	"github.com/alvor-technologies/iag-platform-go/authclient"
 	platformotel "github.com/alvor-technologies/iag-platform-go/otel"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"iag-traceability/backend/internal/anchor"
 	"iag-traceability/backend/internal/auditlog"
@@ -26,6 +27,7 @@ import (
 	"iag-traceability/backend/internal/migrate"
 	"iag-traceability/backend/internal/notify"
 	"iag-traceability/backend/internal/scmclient"
+	"iag-traceability/backend/internal/scmsync"
 	"iag-traceability/backend/internal/store"
 	"iag-traceability/backend/internal/story"
 )
@@ -151,6 +153,13 @@ func main() {
 		// Relay: drain the transactional outbox to Kafka. Only runs when a
 		// broker is configured; otherwise events accumulate durably until it is.
 		go kafkabus.NewRelay(st, kafkaPub).Run(ctx)
+	}
+
+	// SCM custody sync: copy SCM's public.trace_events / lot_qr_codes in, since
+	// nothing relays SCM's outbox and service auth is refused. Errors are
+	// logged and retried each tick; they never stop the server.
+	if cfg.SCMSyncEnabled {
+		startSCMSync(ctx, cfg, pool, st)
 	}
 
 	// L2 notarization / L3 anchoring. Opt-in (ANCHOR_ENABLED): a signer attests a
@@ -328,4 +337,27 @@ func anchorJobLoop(ctx context.Context, svc *anchor.Service, interval time.Durat
 			}
 		}
 	}
+}
+
+// startSCMSync wires the background SCM sync. A missing or unreachable SCM
+// database is logged, not fatal.
+func startSCMSync(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, st *store.Store) {
+	source := pool
+	switch {
+	case cfg.SCMSyncSameDB:
+		log.Printf("[scm-sync] ENABLED (same database, every %s)", cfg.SCMSyncInterval)
+	case cfg.SCMDatabaseURL != "":
+		scmPool, err := pgxpool.New(ctx, cfg.SCMDatabaseURL)
+		if err != nil {
+			log.Printf("[scm-sync] disabled: SCM_DATABASE_URL: %v", err)
+			return
+		}
+		source = scmPool
+		go func() { <-ctx.Done(); scmPool.Close() }()
+		log.Printf("[scm-sync] ENABLED (SCM_DATABASE_URL, every %s)", cfg.SCMSyncInterval)
+	default:
+		log.Printf("[scm-sync] disabled: SCM_SYNC_SAME_DB=false and SCM_DATABASE_URL is empty")
+		return
+	}
+	go scmsync.New(source, st).Loop(ctx, cfg.SCMSyncInterval)
 }
