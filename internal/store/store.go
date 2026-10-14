@@ -49,6 +49,9 @@ type TraceEvent struct {
 	Payload          map[string]any `json:"payload,omitempty"`
 	IdempotencyKey   *string        `json:"idempotency_key,omitempty"`
 	CreatedAt        time.Time      `json:"created_at"`
+	// Inserted is true when AppendEvent wrote a new row, false when an
+	// idempotency_key replay returned the existing one. Not serialised.
+	Inserted bool `json:"-"`
 }
 
 type AppendEventInput struct {
@@ -93,12 +96,12 @@ func (s *Store) AppendEvent(ctx context.Context, in AppendEventInput) (TraceEven
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 		RETURNING id, occurred_at, event_type, entity_type, entity_business_id, entity_id,
-			source_service, created_at`,
+			source_service, created_at, (xmax = 0) AS inserted`,
 		in.OccurredAt, in.EventType, in.EntityType, in.EntityBusinessID, in.EntityID,
 		in.RelatedIDs, in.ActorUserID, in.SourceService, in.Payload, in.IdempotencyKey,
 	).Scan(
 		&ev.ID, &ev.OccurredAt, &ev.EventType, &ev.EntityType, &ev.EntityBusinessID, &ev.EntityID,
-		&ev.SourceService, &ev.CreatedAt,
+		&ev.SourceService, &ev.CreatedAt, &ev.Inserted,
 	)
 	ev.RelatedIDs = in.RelatedIDs
 	ev.Payload = in.Payload

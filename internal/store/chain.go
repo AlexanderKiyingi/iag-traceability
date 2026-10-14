@@ -74,6 +74,7 @@ func (s *Store) appendEventChained(ctx context.Context, in AppendEventInput) (Tr
 	ev.RelatedIDs = in.RelatedIDs
 	ev.Payload = in.Payload
 	ev.IdempotencyKey = in.IdempotencyKey
+	ev.Inserted = inserted
 
 	if inserted {
 		var lastSeq int64

@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	"iag-traceability/backend/internal/db"
 	"iag-traceability/backend/internal/hashchain"
 )
 
@@ -46,7 +47,10 @@ func main() {
 	}
 
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dbURL)
+	// db.NewPool pins search_path to traceability. A bare pgxpool on a DSN
+	// without one resolves trace_events to SCM's public.trace_events in the
+	// shared database.
+	pool, err := db.NewPool(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}

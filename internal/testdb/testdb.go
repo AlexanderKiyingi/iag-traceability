@@ -72,6 +72,7 @@ func Truncate(t *testing.T, pool *pgxpool.Pool) {
 		"custody_chain",
 		"lot_story_overrides",
 		"lot_story_override_audit",
+		"scm_sync_state",
 	}
 	for _, tbl := range tables {
 		if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tbl+" RESTART IDENTITY CASCADE"); err != nil {

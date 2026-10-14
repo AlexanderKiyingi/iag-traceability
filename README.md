@@ -55,6 +55,7 @@ internal/
   store/                trace_events, lot_qr_codes
   consumer/             Kafka — scm.*, mes.*, qc.* → trace_events + projections
   scmclient/            Service-to-service SCM snapshot fetch
+  scmsync/              Same-database copy of SCM custody events + QR codes
   story/                Story composer, publish gate, public QR
 cmd/migrate-scm/        One-time SCM → traceability data copy
 docs/openapi.yaml       OpenAPI spec
@@ -161,6 +162,82 @@ previous, new).
 
 `{ "lot_business_id": "LOT-2026-014", "revoked": true, "qr_code": { …register row, "status": "Revoked" } }`.
 404 when there is no active QR. The token then 404s on `/public/q/:token`.
+
+## SCM custody sync (no Kafka, no service auth)
+
+SCM writes its custody events to `public.trace_events` in the same Postgres
+this service uses, but nothing relays SCM's outbox and service-to-service auth
+is refused, so none of them reach `traceability.trace_events`.
+`internal/scmsync` copies them directly:
+
+- Reads `public.trace_events` and `public.lot_qr_codes` (joined to
+  `public.export_lots`, `public.batches`, `public.suppliers`, `public.farms`),
+  always schema-qualified, so it works on this service's own DSN.
+- Same mapping as the original `cmd/migrate-scm`: business id resolved from
+  the SCM entity (or `related_ids`), payload = SCM `measurements`,
+  `source_service = iag-supply-chain-migration`, idempotency key
+  `scm-migrate:<scm event id>`. Rows a previous one-shot run copied are never
+  duplicated; events with no resolvable business id are skipped.
+- Every event goes through `store.AppendEvent`, the path `POST /api/v1/events`
+  uses: with `CHAIN_ENABLED=true` batch events are hash-chained under the
+  custody-chain advisory lock, and the lot story is refreshed as for a posted
+  event (`story.AfterAppend`).
+- Incremental: the high-water mark is SCM's `(created_at, id)` in
+  `traceability.scm_sync_state` (migration 010). Insertion order, not
+  `occurred_at`, because SCM back-dates events — a late, back-dated event has
+  a new `created_at` and is picked up on the next tick. Each tick re-reads 10
+  minutes behind the mark (out-of-order commits) and drops already-copied
+  rows by key. The first tick after start, and every 60th, is a full rescan
+  as a safety net. Within a page (500 rows) events are appended in
+  `(occurred_at, id)` order.
+- QR codes: SCM rows this service lacks are inserted (`ON CONFLICT DO
+  NOTHING`, with `revoked_at` carried); existing rows are never changed.
+- One replica syncs at a time (`pg_try_advisory_lock` per tick). Each tick
+  logs `[scm-sync] tick ok: full=… scanned=… copied=… existing=… skipped=…
+  qr_copied=…`; a failure is logged, written to `scm_sync_state.last_error`
+  and retried next tick — it never stops the server.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCM_SYNC_ENABLED` | `false` | Run the background sync in `cmd/server`. |
+| `SCM_SYNC_INTERVAL` | `60s` | Tick period (Go duration). |
+| `SCM_SYNC_SAME_DB` | `true` when `SCM_DATABASE_URL` is empty | Read SCM's `public.*` through this service's pool. |
+| `SCM_DATABASE_URL` | — | Separate SCM database (used when `SCM_SYNC_SAME_DB=false`). |
+
+The database role needs `SELECT` on SCM's `public.trace_events`,
+`public.lot_qr_codes`, `public.export_lots`, `public.batches`,
+`public.suppliers` and `public.farms`; without it every tick logs
+`permission denied` and copies nothing.
+
+`go run ./cmd/migrate-scm` is the same copy, once (full scan). It takes the same
+lock, so it refuses to run while a replica is syncing.
+
+### CHAIN_ENABLED cutover runbook
+
+1. **Deploy with `SCM_SYNC_ENABLED=true` and `CHAIN_ENABLED=false`.** Within a
+   tick the log shows `copied=42` (SCM's history: FARMER_REGISTERED +
+   CHERRY_RECEIVED; `skipped=` counts any whose business id cannot be
+   resolved). Confirm:
+   ```sql
+   SELECT event_type, count(*) FROM traceability.trace_events
+   WHERE source_service = 'iag-supply-chain-migration' GROUP BY 1;
+   SELECT last_run_at, last_copied, last_error FROM traceability.scm_sync_state;
+   ```
+2. **Backfill the chain:** `DATABASE_URL=… go run ./cmd/chain-backfill --dry-run`
+   (reports how many batch events would be chained), then the same without
+   `--dry-run`. Re-running is safe: chained events are skipped.
+3. **Set `CHAIN_ENABLED=true`** and redeploy. Run `--dry-run` once more; it
+   should report 0. If events arrived between steps 2 and 3, run it for real
+   again. Then `GET /api/v1/chain/verify` should return `isValid: true`.
+
+Why this order: runtime chaining only links events appended *after*
+`CHAIN_ENABLED` is on, and the backfill appends every unchained batch event,
+oldest first, *after the current chain head*. Copying the history with the
+chain off and backfilling first puts that history at the start of the chain
+in chronological order. Turning the chain on first would put new runtime
+events at the head and the history after them — still a valid chain, but no
+longer in time order. Backfill and runtime appends share the custody-chain
+advisory lock, so they never interleave a block.
 
 ## Tests
 

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"log"
 	"net/http"
 	"strconv"
@@ -212,33 +211,8 @@ func (a *API) RecordEvent(c *gin.Context) {
 	// Refresh the cached lot story so a manually-recorded event (e.g. a CoA or
 	// lab result correction) is reflected without waiting for the next live
 	// public fetch — parity with the Kafka consumer path.
-	a.maybeRebuildLotStory(c.Request.Context(), body.EventType, body.EntityType, body.EntityBusinessID, body.RelatedIDs)
+	story.AfterAppend(c.Request.Context(), a.Store, body.EventType, body.EntityType, body.EntityBusinessID, body.RelatedIDs)
 	c.JSON(http.StatusCreated, ev)
-}
-
-// maybeRebuildLotStory recomposes and persists the affected lot's story
-// projection (and emits scm.lot.story_updated) when a recorded event warrants
-// it. Best-effort: failures are swallowed so they never fail the write.
-func (a *API) maybeRebuildLotStory(ctx context.Context, eventType, entityType, entityBusinessID string, related map[string]any) {
-	if !story.AffectsLotStory(eventType) {
-		return
-	}
-	lotID := ""
-	if entityType == "lot" {
-		lotID = entityBusinessID
-	} else if v, ok := related["lot_business_id"].(string); ok {
-		lotID = v
-	}
-	if lotID == "" {
-		return
-	}
-	if ok, err := story.RebuildStoredLot(ctx, a.Store, lotID, ""); err == nil && ok {
-		// Durable emit: enqueue the story_updated event to the transactional
-		// outbox; the relay delivers it to Kafka with retries.
-		if emitErr := a.Store.EnqueueOutbox(ctx, kafkabus.LotStoryUpdatedRow(lotID)); emitErr != nil {
-			log.Printf("traceability: enqueue story_updated lot=%s: %v", lotID, emitErr)
-		}
-	}
 }
 
 // ListEvents is the event ledger. With no query it is the newest events across

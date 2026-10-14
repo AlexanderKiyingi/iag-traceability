@@ -1,119 +1,67 @@
+// Command migrate-scm copies iag-supply-chain's public.trace_events and
+// public.lot_qr_codes into the traceability schema, once.
+//
+// It is the one-shot form of the background SCM sync (internal/scmsync, run
+// by cmd/server when SCM_SYNC_ENABLED=true): same mapping, same source_service,
+// same idempotency key (scm-migrate:<scm id>), so re-running it — or running it
+// alongside the loop — never duplicates a row. Events go through the normal
+// append path, so they are hash-chained when CHAIN_ENABLED=true.
+//
+// Usage:
+//
+//	DATABASE_URL=... go run ./cmd/migrate-scm                  # SCM in the same database
+//	DATABASE_URL=... SCM_DATABASE_URL=... go run ./cmd/migrate-scm
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"os"
-	"time"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+
+	"iag-traceability/backend/internal/db"
+	"iag-traceability/backend/internal/scmsync"
+	"iag-traceability/backend/internal/store"
 )
 
-// One-time migration: copy public.trace_events and lot_qr_codes into traceability schema.
-// Usage: SCM_DATABASE_URL=... DATABASE_URL=... go run ./cmd/migrate-scm
 func main() {
 	_ = godotenv.Load()
-	scmURL := os.Getenv("SCM_DATABASE_URL")
-	traceURL := os.Getenv("DATABASE_URL")
-	if scmURL == "" || traceURL == "" {
-		log.Fatal("SCM_DATABASE_URL and DATABASE_URL are required")
+	traceURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	scmURL := strings.TrimSpace(os.Getenv("SCM_DATABASE_URL"))
+	if traceURL == "" {
+		log.Fatal("DATABASE_URL is required")
 	}
 	ctx := context.Background()
-	scmPool, err := pgxpool.New(ctx, scmURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer scmPool.Close()
-	tracePool, err := pgxpool.New(ctx, traceURL)
+	// db.NewPool pins search_path to traceability, so the destination writes
+	// can never land in SCM's same-named public tables.
+	tracePool, err := db.NewPool(ctx, traceURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer tracePool.Close()
 
-	rows, err := scmPool.Query(ctx, `
-		SELECT te.id::text, te.occurred_at, te.event_type, te.entity_type,
-			COALESCE(
-				CASE te.entity_type
-					WHEN 'batch' THEN (SELECT business_id FROM batches WHERE id = te.entity_id)
-					WHEN 'lot' THEN (SELECT business_id FROM export_lots WHERE id = te.entity_id)
-					WHEN 'farmer' THEN (SELECT business_id FROM suppliers WHERE id = te.entity_id AND supplier_type = 'farmer')
-					WHEN 'farm' THEN (SELECT business_id FROM farms WHERE id = te.entity_id)
-					WHEN 'party' THEN (SELECT business_id FROM suppliers WHERE id = te.entity_id)
-				END,
-				te.related_ids->>'batch_business_id',
-				te.related_ids->>'lot_business_id',
-				te.related_ids->>'farmer_business_id',
-				te.related_ids->>'farm_business_id',
-				te.related_ids->>'party_business_id'
-			),
-			te.entity_id, te.related_ids, te.actor_id, te.measurements
-		FROM trace_events te ORDER BY te.occurred_at`)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-	var n, skipped int
-	for rows.Next() {
-		var scmID string
-		var occurred time.Time
-		var eventType, entityType, entityBiz, actorID string
-		var entityID *string
-		var rel, meas []byte
-		if err := rows.Scan(&scmID, &occurred, &eventType, &entityType, &entityBiz, &entityID, &rel, &actorID, &meas); err != nil {
+	source := tracePool
+	if scmURL != "" {
+		scmPool, err := pgxpool.New(ctx, scmURL)
+		if err != nil {
 			log.Fatal(err)
 		}
-		if entityBiz == "" {
-			skipped++
-			continue
-		}
-		payload := map[string]any{}
-		_ = json.Unmarshal(meas, &payload)
-		related := map[string]any{}
-		_ = json.Unmarshal(rel, &related)
-		idempotencyKey := "scm-migrate:" + scmID
-		tag, err := tracePool.Exec(ctx, `
-			INSERT INTO trace_events (occurred_at, event_type, entity_type, entity_business_id, entity_id, related_ids, source_service, payload, idempotency_key)
-			VALUES ($1,$2,$3,$4,$5::uuid,$6,'iag-supply-chain-migration',$7,$8)
-			ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
-			occurred, eventType, entityType, entityBiz, entityID, related, payload, idempotencyKey)
-		if err != nil {
-			log.Fatalf("insert event %s: %v", scmID, err)
-		}
-		if tag.RowsAffected() > 0 {
-			n++
-		}
+		defer scmPool.Close()
+		source = scmPool
 	}
-	log.Printf("migrated %d trace_events (%d skipped without business id)", n, skipped)
 
-	qrRows, err := scmPool.Query(ctx, `
-		SELECT el.business_id, q.public_token, q.version, q.published_at, q.scan_count
-		FROM lot_qr_codes q JOIN export_lots el ON el.id = q.lot_id`)
+	st := store.New(tracePool).SetChainEnabled(os.Getenv("CHAIN_ENABLED") == "true")
+	res, err := scmsync.New(source, st).Run(ctx, true)
+	if errors.Is(err, scmsync.ErrLocked) {
+		log.Fatal("the SCM sync is running in a server replica; it already does this — or retry once it finishes")
+	}
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("migrate-scm: %v (%s)", err, res)
 	}
-	defer qrRows.Close()
-	var qn int
-	for qrRows.Next() {
-		var lotBiz, token string
-		var version int
-		var published *time.Time
-		var scans int64
-		if err := qrRows.Scan(&lotBiz, &token, &version, &published, &scans); err != nil {
-			log.Fatal(err)
-		}
-		tag, err := tracePool.Exec(ctx, `
-			INSERT INTO lot_qr_codes (lot_business_id, public_token, version, published_at, scan_count)
-			VALUES ($1,$2,$3,$4,$5) ON CONFLICT (lot_business_id) DO NOTHING`,
-			lotBiz, token, version, published, scans)
-		if err != nil {
-			log.Fatalf("insert qr %s: %v", lotBiz, err)
-		}
-		if tag.RowsAffected() > 0 {
-			qn++
-		}
-	}
-	fmt.Printf("migrated %d lot_qr_codes\n", qn)
+	log.Printf("migrated %d trace_events (%d already present, %d skipped without business id); migrated %d lot_qr_codes",
+		res.Copied, res.Existing, res.Skipped, res.QRCopied)
 }
