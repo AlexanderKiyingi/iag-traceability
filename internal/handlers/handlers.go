@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alvor-technologies/iag-platform-go/apierr"
@@ -157,6 +158,10 @@ func (a *API) RecordEvent(c *gin.Context) {
 		apierr.BadRequest(c, "entity_type must be one of: lot, batch, farm, party")
 		return
 	}
+	if err := story.ValidateEventPayload(body.EventType, body.EntityType, body.Payload); err != nil {
+		apierr.BadRequest(c, err.Error())
+		return
+	}
 	if body.EventType == "CORRECTION" {
 		if claims, ok := middleware.PlatformClaims(c); !ok || !claims.IsSuperuser {
 			apierr.Write(c, http.StatusForbidden, apierr.CodeForbidden, "CORRECTION events require superuser")
@@ -236,27 +241,26 @@ func (a *API) maybeRebuildLotStory(ctx context.Context, eventType, entityType, e
 	}
 }
 
+// ListEvents is the event ledger. With no query it is the newest events across
+// every entity; see parseEventFilter for the optional filters.
 func (a *API) ListEvents(c *gin.Context) {
-	entityType := c.Query("entity_type")
-	businessID := c.Query("entity_business_id")
-	scoped, reason := eventFilterMode(entityType, businessID)
+	f, reason := parseEventFilter(c.Query("entity_type"), c.Query("entity_business_id"),
+		c.Query("event_type"), c.Query("from"), c.Query("to"))
 	if reason != "" {
 		apierr.BadRequest(c, reason)
 		return
 	}
 	limit := parseLimit(c.Query("limit"))
-	var events []store.TraceEvent
-	var err error
-	if scoped {
-		events, err = a.Store.ListEventsForEntity(c.Request.Context(), entityType, businessID, limit+1)
-	} else {
-		events, err = a.Store.ListRecentEvents(c.Request.Context(), limit+1)
-	}
+	f.Limit = limit + 1
+	events, err := a.Store.ListEvents(c.Request.Context(), f)
 	if err != nil {
 		apierr.Write(c, http.StatusInternalServerError, apierr.CodeInternal, "failed to list events")
 		return
 	}
 	events, hasMore := trimForLimit(events, limit)
+	if events == nil {
+		events = []store.TraceEvent{}
+	}
 	c.JSON(http.StatusOK, gin.H{"events": events, "has_more": hasMore, "limit": limit})
 }
 
@@ -334,7 +338,14 @@ func (a *API) RevokeLotQR(c *gin.Context) {
 	if tokenErr == nil && a.QRCache != nil {
 		a.QRCache.Delete(c.Request.Context(), publicQRCacheKey(qr.PublicToken))
 	}
-	c.JSON(http.StatusOK, gin.H{"lot_business_id": lotID, "revoked": true})
+	resp := gin.H{"lot_business_id": lotID, "revoked": true}
+	// The register row after revocation, so the register can update in place.
+	// Additive: callers reading only lot_business_id/revoked are unaffected.
+	if row, err := a.Store.GetQRRegisterRow(c.Request.Context(), lotID); err == nil {
+		row.PublicURL = a.publicURLFor(row.Token)
+		resp["qr_code"] = row
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (a *API) PublicQR(c *gin.Context) {
@@ -397,25 +408,66 @@ func (a *API) PublicQRPng(c *gin.Context) {
 	c.Data(http.StatusOK, "image/png", png)
 }
 
-// eventFilterMode decides whether a ListEvents call is scoped to one entity.
+// maxEventTypeFilters caps the event_type comma list.
+const maxEventTypeFilters = 25
+
+// parseEventFilter turns the ListEvents query into a store filter.
 //
-// The rule is both filters or neither. Requiring them unconditionally — which
-// is what this service used to do — meant the event ledger, a page with no
-// entity in hand, had no endpoint it could call at all. Accepting half a filter
-// would be worse than either: `?entity_type=batch` alone reads as "every batch
-// event" and would quietly return every event of every kind.
+// entity_business_id needs entity_type: an id alone is ambiguous across
+// entity classes. entity_type alone is a real filter (every event of that
+// class) — it used to be refused because it was silently ignored, which read
+// "every batch event" as "every event". event_type is a comma list (OR).
+// from/to bound occurred_at and take RFC 3339 or YYYY-MM-DD; a date-only to
+// includes that whole day.
 //
-// Returns the scope decision and, when the request is malformed, the reason to
-// refuse it with.
-func eventFilterMode(entityType, businessID string) (scoped bool, reason string) {
-	if entityType == "" && businessID == "" {
-		return false, ""
+// Returns the filter and, when the request is malformed, the reason to refuse
+// it with.
+func parseEventFilter(entityType, businessID, eventTypes, from, to string) (store.EventFilter, string) {
+	var f store.EventFilter
+	entityType = strings.TrimSpace(entityType)
+	businessID = strings.TrimSpace(businessID)
+	if businessID != "" && entityType == "" {
+		return f, "entity_business_id requires entity_type"
 	}
-	if entityType == "" || businessID == "" {
-		return false, "entity_type and entity_business_id must be given together"
+	if entityType != "" && !validEntityType(entityType) {
+		return f, "entity_type must be one of: lot, batch, farm, party"
 	}
-	if !validEntityType(entityType) {
-		return false, "entity_type must be one of: lot, batch, farm, party"
+	f.EntityType, f.EntityBusinessID = entityType, businessID
+	for _, t := range strings.Split(eventTypes, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			f.EventTypes = append(f.EventTypes, t)
+		}
 	}
-	return true, ""
+	if len(f.EventTypes) > maxEventTypeFilters {
+		return f, "too many event_type values (max 25)"
+	}
+	if from = strings.TrimSpace(from); from != "" {
+		t, _, err := parseTimeOrDate(from)
+		if err != nil {
+			return f, "from must be RFC 3339 or YYYY-MM-DD"
+		}
+		f.From = &t
+	}
+	if to = strings.TrimSpace(to); to != "" {
+		t, dateOnly, err := parseTimeOrDate(to)
+		if err != nil {
+			return f, "to must be RFC 3339 or YYYY-MM-DD"
+		}
+		if dateOnly {
+			t = t.AddDate(0, 0, 1)
+		}
+		f.To = &t
+	}
+	if f.From != nil && f.To != nil && !f.From.Before(*f.To) {
+		return f, "from must be before to"
+	}
+	return f, ""
+}
+
+func parseTimeOrDate(s string) (time.Time, bool, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), false, nil
+	}
+	t, err := time.ParseInLocation("2006-01-02", s, time.UTC)
+	return t, true, err
 }

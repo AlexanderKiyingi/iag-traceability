@@ -22,33 +22,104 @@ paths:
           description: Chain nodes from trace_events
   /api/v1/events:
     get:
-      summary: List custody events for an entity
+      summary: Event ledger (global, or filtered)
+      description: |
+        Permission `traceability.view_events`. With no query parameters this is
+        the newest events across every entity (newest first). All filters are
+        optional and combine with AND. `entity_type` + `entity_business_id`
+        scopes the list to one entity, which is then ordered oldest-first (a
+        chain of custody reads forwards); every other list is newest-first.
+        Response shape is unchanged from earlier versions; `payload` (and
+        `actor_user_id` when known) are included on each event.
       security:
         - bearerAuth: []
       parameters:
+        - name: event_type
+          in: query
+          description: Comma list, matched with OR (max 25), e.g. CUSTODY_TRANSFERRED,CUSTODY_IN_TRANSIT,CUSTODY_RECEIVED
+          schema: { type: string }
         - name: entity_type
           in: query
-          required: true
-          schema:
-            type: string
+          description: lot | batch | farm | party. May be given alone.
+          schema: { type: string, enum: [lot, batch, farm, party] }
         - name: entity_business_id
           in: query
-          required: true
-          schema:
-            type: string
+          description: Requires entity_type.
+          schema: { type: string }
+        - name: from
+          in: query
+          description: Inclusive lower bound on occurred_at. RFC 3339 or YYYY-MM-DD (UTC midnight).
+          schema: { type: string }
+        - name: to
+          in: query
+          description: Exclusive upper bound on occurred_at. RFC 3339 is used as given; YYYY-MM-DD includes that whole UTC day.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200, maximum: 499 }
       responses:
         "200":
           description: Event list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/TraceEvent" }
+                  has_more: { type: boolean }
+                  limit: { type: integer }
+        "400":
+          description: entity_business_id without entity_type, unknown entity_type, bad from/to, from >= to, or more than 25 event types
     post:
       summary: Append a custody event
+      description: |
+        Permission `traceability.add_trace_event` (CORRECTION additionally
+        requires superuser). Custody transfer types — CUSTODY_TRANSFERRED,
+        CUSTODY_IN_TRANSIT, CUSTODY_RECEIVED — are accepted for entity_type
+        lot or batch only and require `payload.from` and `payload.to`
+        (non-empty strings) and `payload.quantity_kg` (number >= 0). They take
+        the same append path as every other event, including the custody
+        hash-chain for batch events when CHAIN_ENABLED is on.
       security:
         - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_type, entity_type, entity_business_id]
+              properties:
+                event_type: { type: string, example: CUSTODY_TRANSFERRED }
+                entity_type: { type: string, enum: [lot, batch, farm, party] }
+                entity_business_id: { type: string, example: LOT-2026-014 }
+                entity_id: { type: string, format: uuid }
+                occurred_at: { type: string, format: date-time, description: "Defaults to now; may not be more than 5 minutes in the future" }
+                related_ids: { type: object, additionalProperties: true }
+                payload:
+                  type: object
+                  additionalProperties: true
+                  example: { from: "Wet mill A", to: "Warehouse 2", quantity_kg: 1200.5 }
+                idempotency_key: { type: string }
       responses:
         "201":
-          description: Event created
+          description: Event created (or the existing event for a repeated idempotency_key)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TraceEvent" }
+        "400":
+          description: Missing fields, unknown event_type/entity_type, invalid transfer payload, or future occurred_at
+        "403":
+          description: Missing permission, or CORRECTION without superuser
   /api/v1/lots/{businessId}/publish:
     post:
       summary: Publish public QR for export lot
+      description: |
+        Permission `traceability.publish_qr`. Publishing again ROTATES the
+        token (version + 1) and breaks every printed label — to change the
+        story text use PATCH /api/v1/qr-codes/{lotBusinessId} instead.
       security:
         - bearerAuth: []
       responses:
@@ -57,11 +128,112 @@ paths:
   /api/v1/lots/{businessId}/revoke:
     post:
       summary: Revoke public QR for export lot
+      description: |
+        Permission `traceability.publish_qr`. After revocation the token no
+        longer resolves on /public/q/{token} (404); the service cache is
+        cleared and the public Cache-Control is 60 s.
       security:
         - bearerAuth: []
+      parameters:
+        - { name: businessId, in: path, required: true, schema: { type: string } }
       responses:
         "200":
-          description: QR revoked
+          description: QR revoked. `qr_code` (added) is the register row after revocation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lot_business_id: { type: string }
+                  revoked: { type: boolean, example: true }
+                  qr_code: { $ref: "#/components/schemas/QRCode" }
+        "404":
+          description: No active QR for the lot (missing or already revoked)
+  /api/v1/qr-codes:
+    get:
+      summary: QR register
+      description: Permission `traceability.view_chain`. Every lot QR, live and revoked, most recently touched first.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          description: live | revoked (case-insensitive). Omit for all.
+          schema: { type: string }
+        - name: q
+          in: query
+          description: Case-insensitive substring of lot business id, story title/body override, composed title, or a farmer name.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200, maximum: 499 }
+      responses:
+        "200":
+          description: Register rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  qr_codes:
+                    type: array
+                    items: { $ref: "#/components/schemas/QRCode" }
+                  has_more: { type: boolean }
+                  limit: { type: integer }
+        "400":
+          description: Unknown status
+  /api/v1/qr-codes/{lotBusinessId}:
+    get:
+      summary: One QR register row
+      description: Permission `traceability.view_chain`. Returns the row whether live or revoked.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: lotBusinessId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Register row
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QRCode" }
+        "404":
+          description: The lot has no QR
+    patch:
+      summary: Edit the public story (never re-publishes)
+      description: |
+        Permission `traceability.publish_qr`. Sets the lot's story override.
+        Never touches the token or version, so printed labels keep working.
+        An omitted field is left unchanged; an empty (or whitespace-only)
+        string clears that field's override; clearing both removes the
+        override. Values are trimmed. The public read (/public/q/{token}) and
+        the composer serve `story.story_title` / `story.story_body` from the
+        override; the rest of the composed story is unchanged. Every edit is
+        recorded in lot_story_override_audit (who, previous and new values)
+        and in traceability_api_audit.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: lotBusinessId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                story_title: { type: string, maxLength: 200 }
+                story_body: { type: string, maxLength: 5000 }
+              example: { story_title: "Washed Arabica from Mt Elgon", story_body: "Hand picked by 42 smallholders." }
+      responses:
+        "200":
+          description: The updated register row
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QRCode" }
+        "400":
+          description: Neither field given, a field too long, or invalid JSON (body cap 64 KiB)
+        "404":
+          description: The lot has no QR
   /api/v1/admin/audit-logs:
     get:
       summary: List HTTP API audit entries
@@ -117,7 +289,12 @@ paths:
             type: string
       responses:
         "200":
-          description: Public story JSON (Cache-Control public)
+          description: |
+            Public story JSON (Cache-Control public, max-age 60). When the lot
+            has a story override, `story.story_title` / `story.story_body`
+            carry it.
+        "404":
+          description: Unknown or revoked token
   /public/q/{token}/qr.png:
     get:
       summary: Public QR code image (PNG) encoding the story URL
@@ -136,6 +313,47 @@ paths:
                 type: string
                 format: binary
 components:
+  schemas:
+    TraceEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        event_type: { type: string }
+        entity_type: { type: string }
+        entity_business_id: { type: string }
+        entity_id: { type: string, format: uuid, description: omitted when null }
+        related_ids: { type: object, additionalProperties: true, description: omitted when empty }
+        actor_user_id: { type: string, format: uuid, description: omitted when null }
+        source_service: { type: string }
+        payload: { type: object, additionalProperties: true, description: "omitted when empty; transfers carry from, to, quantity_kg" }
+        idempotency_key: { type: string, description: "POST response only" }
+        created_at: { type: string, format: date-time }
+    StoryOverride:
+      type: object
+      nullable: true
+      properties:
+        story_title: { type: string, nullable: true }
+        story_body: { type: string, nullable: true }
+        updated_by: { type: string, description: "Display name (or email/subject) of the editor" }
+        updated_by_user_id: { type: string, format: uuid, description: omitted when unknown }
+        updated_at: { type: string, format: date-time }
+    QRCode:
+      type: object
+      properties:
+        lot_business_id: { type: string }
+        token: { type: string }
+        version: { type: integer, description: "Increments only when the QR is re-published (token rotated)" }
+        public_url: { type: string, description: "PUBLIC_TRACE_BASE_URL + '/' + token, as publish builds it" }
+        published_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        scan_count: { type: integer }
+        status: { type: string, enum: [Live, Revoked, Unpublished], description: "Revoked when revoked_at is set; Live when published and not revoked; Unpublished is defensive (published_at null)" }
+        story_title: { type: string, nullable: true, description: "Override title, else a `title` the composed story carries, else null" }
+        story_override: { $ref: "#/components/schemas/StoryOverride" }
+        farmer_names: { type: array, items: { type: string }, description: "From the composed story's farmers (name / full_name / display_name); [] when none" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time, description: "Latest of the QR row and the override (scans also touch the QR row)" }
   securitySchemes:
     bearerAuth:
       type: http

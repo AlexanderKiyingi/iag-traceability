@@ -46,8 +46,50 @@ func RebuildStoredLot(ctx context.Context, st *store.Store, lotBusinessID, publi
 	return true, nil
 }
 
-// RebuildLotProjection composes a public coffee story from trace events + SCM lot snapshot.
+// RebuildLotProjection composes a public coffee story from trace events + SCM
+// lot snapshot, then lays the lot's hand-edited story override (if any) on top.
 func RebuildLotProjection(ctx context.Context, st *store.Store, scm *scmclient.Client, lotBusinessID, publicURL string) (map[string]any, error) {
+	composed, err := composeLotProjection(ctx, st, scm, lotBusinessID, publicURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyStoredOverride(ctx, st, lotBusinessID, composed); err != nil {
+		return nil, err
+	}
+	return composed, nil
+}
+
+// applyStoredOverride reads the lot's override and applies it to story.
+func applyStoredOverride(ctx context.Context, st *store.Store, lotBusinessID string, story map[string]any) error {
+	if st == nil || story == nil {
+		return nil
+	}
+	ov, err := st.GetStoryOverride(ctx, lotBusinessID)
+	if err != nil {
+		return err
+	}
+	ApplyStoryOverride(story, ov)
+	return nil
+}
+
+// ApplyStoryOverride lays a hand-edited override over a composed story: the
+// override's story_title / story_body win, everything else the composer
+// produced stays. A nil override changes nothing; clearing an override strips
+// the keys from the stored projection in the same transaction
+// (store.SetStoryOverride), so no stale value lingers in the fallback.
+func ApplyStoryOverride(story map[string]any, ov *store.StoryOverride) {
+	if story == nil || ov == nil {
+		return
+	}
+	if ov.StoryTitle != nil {
+		story["story_title"] = *ov.StoryTitle
+	}
+	if ov.StoryBody != nil {
+		story["story_body"] = *ov.StoryBody
+	}
+}
+
+func composeLotProjection(ctx context.Context, st *store.Store, scm *scmclient.Client, lotBusinessID, publicURL string) (map[string]any, error) {
 	story := map[string]any{
 		"brand":      "IAG Africa Coffee Park",
 		"public_url": publicURL,
@@ -397,6 +439,10 @@ func journeyStage(eventType string) string {
 		return "Lab"
 	case "LOT_QR_PUBLISHED", "LOT_ASSEMBLED":
 		return "Export"
+	case CustodyTransferred, CustodyInTransit, CustodyReceived:
+		// Only the stage reaches the public journey — from/to name holders,
+		// which may be commercial counterparties, and stay out of it.
+		return "Custody"
 	default:
 		return eventType
 	}

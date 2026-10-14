@@ -102,6 +102,10 @@ func resolvePublicQR(ctx context.Context, st *store.Store, token, baseURL string
 		}
 		payload.Status = "pending"
 	}
+	// The live compose already applied the override; the cached and pending
+	// fallbacks have not. Applying again is idempotent. A failed read leaves the story as composed
+	// rather than failing the scan.
+	_ = applyStoredOverride(ctx, st, qr.LotBusinessID, payload.Story)
 	return payload, nil
 }
 

@@ -77,6 +77,11 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 		v1.POST("/events", appmw.RequirePermission("traceability.add_trace_event"), api.RecordEvent)
 		v1.POST("/lots/:businessId/publish", appmw.RequirePermission("traceability.publish_qr"), api.PublishLotQR)
 		v1.POST("/lots/:businessId/revoke", appmw.RequirePermission("traceability.publish_qr"), api.RevokeLotQR)
+		// QR register. Editing the story never re-publishes (that would rotate
+		// the token and break printed labels).
+		v1.GET("/qr-codes", appmw.RequirePermission("traceability.view_chain"), api.ListQRCodes)
+		v1.GET("/qr-codes/:lotBusinessId", appmw.RequirePermission("traceability.view_chain"), api.GetQRCode)
+		v1.PATCH("/qr-codes/:lotBusinessId", appmw.RequirePermission("traceability.publish_qr"), api.PatchQRStory)
 
 		admin := v1.Group("/admin")
 		admin.Use(appmw.RequirePermission("audit.view_api_log"))
